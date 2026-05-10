@@ -20,39 +20,47 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                    Carry_Scalper_Optimized.mq5   |
-//|                     Quick in/out – close as soon as profit > 0  |
-//|                     Max hold time to cut losers                |
+//|                                    Fast_Pairs_Trading_EA.mq5     |
+//|                     Closes as soon as total profit > 0          |
+//|                     No max hold time, pure scalping             |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Scalper Carry"
-#property version   "3.0"
+#property copyright "Fast Pairs Trading"
+#property version   "6.0"
 #property strict
 
-// --- INPUTS --------------------------------------------------------+
-input string   TradeSymbol      = "AUDJPY.vx";    // Your symbol
-input double   RiskPercent      = 2.0;            // Reduced from 5% for safety
-input int      MaxHoldSeconds   = 300;            // Max hold time in seconds (5 minutes)
-input int      MaxOpenPositions = 1;
-input int      MagicNumber      = 999555;
-input bool     UseAutoDirection = true;           // true = pick higher swap
-input bool     ManualLong       = false;
-input double   MinSwapToTrade   = -999.0;         // Allow any swap
+// --- INPUTS (use your broker's .vx symbols) -----------------------+
+input string   AssetA           = "EURUSD.vx";
+input string   AssetB           = "GBPUSD.vx";
+input double   RiskPercent      = 2.0;              // % equity per trade (total both legs)
+input int      LookbackPeriod   = 50;               // Period for spread mean/std dev
+input double   EntryZScore      = 2.0;              // Entry threshold (absolute)
+input bool     CloseOnAnyProfit = true;             // Close when total profit > 0
+input double   MinProfitUSD     = 0.01;             // Tiny profit buffer (if CloseOnAnyProfit = false)
+input int      MagicNumber      = 777888;
 input int      StartHour        = 0;
 input int      EndHour          = 24;
 input double   MaxDailyLossPercent = 10.0;
-input bool     CloseOnAnyProfit = true;           // NEW: close immediately when profit > 0
-input double   MinProfitUSD     = 0.01;           // Tiny profit target (0.01$)
+input bool     DebugPrint       = true;
 
 // --- GLOBALS -------------------------------------------------------+
-CTrade trade;
+CTrade tradeA, tradeB;
+double spreadBuffer[];
 datetime lastDebug = 0;
+datetime lastTrade = 0;
 datetime dayStart = 0;
-datetime openTime = 0;
 double dailyEquityStart = 0;
+int consecutiveLosses = 0;
 bool tradingEnabled = true;
-ulong carryTicket = 0;
+
+struct ActivePair {
+   ulong ticketA;
+   ulong ticketB;
+   datetime openTime;
+   bool isOpen;
+};
+ActivePair currentPair;
 
 //+------------------------------------------------------------------+
 bool IsTradingTime() {
@@ -61,44 +69,74 @@ bool IsTradingTime() {
    return (dt.hour >= StartHour && dt.hour < EndHour);
 }
 
-double GetSwapLong() { return SymbolInfoDouble(TradeSymbol, SYMBOL_SWAP_LONG); }
-double GetSwapShort() { return SymbolInfoDouble(TradeSymbol, SYMBOL_SWAP_SHORT); }
-
-void CloseTrade(string reason) {
-   if(carryTicket != 0 && PositionSelectByTicket(carryTicket)) {
-      trade.PositionClose(carryTicket);
-      Print("Closed trade: ", reason, " Ticket: ", carryTicket);
-      carryTicket = 0;
-      openTime = 0;
+//+------------------------------------------------------------------+
+double GetZScore() {
+   double bidA = SymbolInfoDouble(AssetA, SYMBOL_BID);
+   double bidB = SymbolInfoDouble(AssetB, SYMBOL_BID);
+   if(bidA <= 0 || bidB <= 0) return 0;
+   double spread = bidA - bidB;
+   
+   int sz = ArraySize(spreadBuffer);
+   if(sz < LookbackPeriod) {
+      ArrayResize(spreadBuffer, LookbackPeriod);
+      for(int i=sz; i<LookbackPeriod; i++) spreadBuffer[i] = spread;
    }
+   for(int i=LookbackPeriod-1; i>0; i--)
+      spreadBuffer[i] = spreadBuffer[i-1];
+   spreadBuffer[0] = spread;
+   
+   double mean = 0;
+   for(int i=0; i<LookbackPeriod; i++) mean += spreadBuffer[i];
+   mean /= LookbackPeriod;
+   double variance = 0;
+   for(int i=0; i<LookbackPeriod; i++) variance += MathPow(spreadBuffer[i] - mean, 2);
+   double stdDev = MathSqrt(variance / LookbackPeriod);
+   if(stdDev == 0) return 0;
+   return (spread - mean) / stdDev;
+}
+
+//+------------------------------------------------------------------+
+void ClosePairTrade(string reason) {
+   if(!currentPair.isOpen) return;
+   if(currentPair.ticketA != 0 && PositionSelectByTicket(currentPair.ticketA))
+      tradeA.PositionClose(currentPair.ticketA);
+   if(currentPair.ticketB != 0 && PositionSelectByTicket(currentPair.ticketB))
+      tradeB.PositionClose(currentPair.ticketB);
+   currentPair.isOpen = false;
+   Print("Closed pair trade: ", reason);
 }
 
 //+------------------------------------------------------------------+
 int OnInit() {
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
-   SymbolSelect(TradeSymbol, true);
+   tradeA.SetExpertMagicNumber(MagicNumber);
+   tradeB.SetExpertMagicNumber(MagicNumber+1);
+   SymbolSelect(AssetA, true);
+   SymbolSelect(AssetB, true);
+   currentPair.isOpen = false;
    dayStart = TimeCurrent();
    dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    Print("==============================================");
-   Print("⚡ CARRY SCALPER (Optimized)");
-   Print("   Symbol: ", TradeSymbol);
-   Print("   Long swap: ", GetSwapLong(), " | Short swap: ", GetSwapShort());
-   Print("   Max hold seconds: ", MaxHoldSeconds);
-   Print("   Close on any profit: ", CloseOnAnyProfit);
+   Print("⚡ FAST PAIRS TRADING (Close on any profit)");
+   Print("   ", AssetA, " <-> ", AssetB);
+   Print("   Entry Z‑Score: ±", EntryZScore);
+   Print("   CloseOnAnyProfit: ", CloseOnAnyProfit);
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
 void OnTick() {
-   datetime now = TimeCurrent();
+   if(!IsTradingTime()) {
+      if(currentPair.isOpen) ClosePairTrade("Session ended");
+      return;
+   }
    
-   // Daily reset & loss limit
+   datetime now = TimeCurrent();
    if(now - dayStart >= 86400) {
       dayStart = now;
       dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
       tradingEnabled = true;
+      consecutiveLosses = 0;
       Print("✅ New trading day");
    }
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -111,73 +149,78 @@ void OnTick() {
    if(!tradingEnabled && lossPercent < MaxDailyLossPercent-2) tradingEnabled = true;
    if(!tradingEnabled) return;
    
-   // --- Manage open position ---
-   if(carryTicket != 0 && PositionSelectByTicket(carryTicket)) {
-      double profit = PositionGetDouble(POSITION_PROFIT);
+   // --- Manage active pair trade (fast profit exit) ---
+   if(currentPair.isOpen) {
+      double profitA = 0, profitB = 0;
+      if(currentPair.ticketA != 0 && PositionSelectByTicket(currentPair.ticketA))
+         profitA = PositionGetDouble(POSITION_PROFIT);
+      if(currentPair.ticketB != 0 && PositionSelectByTicket(currentPair.ticketB))
+         profitB = PositionGetDouble(POSITION_PROFIT);
+      double totalProfit = profitA + profitB;
       
-      // Fast exit: close on any profit (or when profit >= MinProfitUSD)
-      if(CloseOnAnyProfit && profit > 0) {
-         CloseTrade("Profit > 0 ($" + DoubleToString(profit,2) + ")");
+      if(CloseOnAnyProfit && totalProfit > 0) {
+         ClosePairTrade("Profit > 0 ($" + DoubleToString(totalProfit,2) + ")");
+         consecutiveLosses = 0;
          return;
       }
-      if(!CloseOnAnyProfit && profit >= MinProfitUSD) {
-         CloseTrade("Profit target $" + DoubleToString(MinProfitUSD));
-         return;
-      }
-      // Max hold time – force close to prevent drawdown
-      if(MaxHoldSeconds > 0 && openTime > 0 && (now - openTime) >= MaxHoldSeconds) {
-         CloseTrade("Max hold time reached");
+      if(!CloseOnAnyProfit && totalProfit >= MinProfitUSD) {
+         ClosePairTrade("Profit target $" + DoubleToString(MinProfitUSD));
+         consecutiveLosses = 0;
          return;
       }
       return; // still holding
    }
    
-   // --- No open trade – check for entry ---
-   if(!IsTradingTime()) return;
-   if(PositionsTotal() >= MaxOpenPositions) return;
-   
-   // Determine direction based on swap (or manual)
-   bool doBuy = false, doSell = false;
-   double swapLong = GetSwapLong();
-   double swapShort = GetSwapShort();
-   
-   if(UseAutoDirection) {
-      if(swapLong >= swapShort) {
-         if(swapLong >= MinSwapToTrade) doBuy = true;
-      } else {
-         if(swapShort >= MinSwapToTrade) doSell = true;
-      }
-   } else {
-      doBuy = ManualLong;
-      doSell = !ManualLong;
+   // --- No active pair: open new trade if Z‑score threshold met ---
+   if(consecutiveLosses >= 3) {
+      static int warn=0; if(warn++%50==0) Print("⛔ Paused due to consecutive losses");
+      return;
    }
+   if(now - lastTrade < 10) return; // cooldown
    
-   // Debug every 30 sec
-   if(now - lastDebug >= 30) {
+   double zScore = GetZScore();
+   if(zScore == 0 || ArraySize(spreadBuffer) < LookbackPeriod) return;
+   
+   if(DebugPrint && now - lastDebug >= 5) {
       lastDebug = now;
-      Print("📊 Swap L=", swapLong, " S=", swapShort, " Buy=", doBuy, " Sell=", doSell);
+      double bidA = SymbolInfoDouble(AssetA, SYMBOL_BID);
+      double bidB = SymbolInfoDouble(AssetB, SYMBOL_BID);
+      Print("📊 Spread: ", DoubleToString(bidA-bidB,5), " Z‑Score: ", DoubleToString(zScore,2));
    }
-   if(!doBuy && !doSell) return;
    
-   // Position sizing
+   bool openShortA_LongB = (zScore > EntryZScore);
+   bool openLongA_ShortB = (zScore < -EntryZScore);
+   if(!openShortA_LongB && !openLongA_ShortB) return;
+   
    double lot = NormalizeDouble(equity / 1000.0 * (RiskPercent / 100.0), 2);
-   lot = MathMax(0.01, MathMin(lot, SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MAX)));
-   double ask = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
+   lot = MathMax(0.01, lot);
+   lot = MathMin(lot, SymbolInfoDouble(AssetA, SYMBOL_VOLUME_MAX));
    
-   // Open trade WITHOUT stop loss or take profit (we close manually on profit/time)
-   if(doBuy) {
-      if(trade.Buy(lot, TradeSymbol, ask, 0, 0, "Scalp Long")) {
-         carryTicket = trade.ResultOrder();
-         openTime = now;
-         Print("🔥 BUY opened. Lot=", lot, " SwapLong=", swapLong);
-      } else Print("❌ Buy failed. Error ", GetLastError());
-   } else if(doSell) {
-      if(trade.Sell(lot, TradeSymbol, bid, 0, 0, "Scalp Short")) {
-         carryTicket = trade.ResultOrder();
-         openTime = now;
-         Print("🔥 SELL opened. Lot=", lot, " SwapShort=", swapShort);
-      } else Print("❌ Sell failed. Error ", GetLastError());
+   double askA = SymbolInfoDouble(AssetA, SYMBOL_ASK);
+   double bidA = SymbolInfoDouble(AssetA, SYMBOL_BID);
+   double askB = SymbolInfoDouble(AssetB, SYMBOL_ASK);
+   double bidB = SymbolInfoDouble(AssetB, SYMBOL_BID);
+   
+   ulong ticketA = 0, ticketB = 0;
+   if(openShortA_LongB) {
+      ticketA = tradeA.Sell(lot, AssetA, bidA, 0, 0, "Short A");
+      ticketB = tradeB.Buy(lot, AssetB, askB, 0, 0, "Long B");
+   } else {
+      ticketA = tradeA.Buy(lot, AssetA, askA, 0, 0, "Long A");
+      ticketB = tradeB.Sell(lot, AssetB, bidB, 0, 0, "Short B");
+   }
+   
+   if(ticketA != 0 && ticketB != 0) {
+      currentPair.ticketA = ticketA;
+      currentPair.ticketB = ticketB;
+      currentPair.openTime = now;
+      currentPair.isOpen = true;
+      lastTrade = now;
+      Print("🔥 Opened pair trade. Lots=", lot, " Z=", zScore);
+   } else {
+      if(ticketA != 0) tradeA.PositionClose(ticketA);
+      if(ticketB != 0) tradeB.PositionClose(ticketB);
+      Print("❌ Failed to open pair trade");
    }
 }
 //+------------------------------------------------------------------+
