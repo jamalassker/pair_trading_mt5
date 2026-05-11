@@ -166,82 +166,54 @@ int OnInit() {
 }
 
 //+------------------------------------------------------------------+
+// ... (Your inputs remain the same)
+
 void OnTick() {
-   if(!IsTradingHours()) {
+   if(!IsTradingHours() || !tradingEnabled) {
       if(currentTicket != 0) CloseTrade();
       return;
    }
-   
-   datetime now = TimeCurrent();
-   if(now - dayStart >= 86400) {
-      dayStart = now;
-      dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
-      tradingEnabled = true;
-      consecutiveLosses = 0;
-      Print("✅ New trading day");
+
+   // 1. REFRESH DATA FIRST
+   // Copy 2 bars so we can check "previous" (1) and "current" (0)
+   if(CopyBuffer(bb_handle, 1, 0, 2, bb_upper) < 2 || 
+      CopyBuffer(bb_handle, 2, 0, 2, bb_lower) < 2 ||
+      CopyBuffer(atr_handle, 0, 0, 2, atr_values) < 2) {
+      return; 
    }
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lossPercent = (dailyEquityStart - equity) / dailyEquityStart * 100.0;
-   if(lossPercent >= MaxDailyLossPercent) {
-      if(tradingEnabled) Print("🚨 Daily loss limit reached");
-      tradingEnabled = false;
-      return;
-   }
-   if(!tradingEnabled && lossPercent < MaxDailyLossPercent-2) tradingEnabled = true;
-   if(!tradingEnabled) return;
-   
-   // --- Manage open position ---
-   if(currentTicket != 0 && PositionSelectByTicket(currentTicket)) {
-      if(CloseOnAnyProfit) {
-         double profit = PositionGetDouble(POSITION_PROFIT);
-         if(profit > 0) {
-            CloseTrade();
-            Print("✅ Closed on profit: $", profit);
-            consecutiveLosses = 0;
-            return;
-         }
-      }
-      return;
-   }
-   if(currentTicket != 0 && !PositionSelectByTicket(currentTicket)) currentTicket = 0;
-   if(currentTicket != 0) return;
-   
-   // Cooldown and bar check
-   static datetime lastTradeTime = 0;
-   if(now - lastTradeTime < 3) return;
-   datetime currentBar = iTime(SymbolToTrade, PERIOD_M1, 0);
-   if(currentBar == lastBar) return;
-   lastBar = currentBar;
-   
-   // Get indicator data
-   if(CopyBuffer(bb_handle, 1, 0, 1, bb_upper) < 1 ||
-      CopyBuffer(bb_handle, 2, 0, 1, bb_lower) < 1) return;
-   
-   // 7. ADDED debug print
-   if(DebugPrint) {
-      Print("Upper=", bb_upper[0],
-            " Lower=", bb_lower[0],
-            " Ask=", SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK));
-   }
-   
-   // 5. REPLACED signal logic
-   if(IsSqueeze()) {
+
+   // 2. CHECK FOR SQUEEZE (Calculated on current data)
+   double spread = bb_upper[0] - bb_lower[0];
+   if(spread < atr_values[0] * 2.5) {
       squeezeDetected = true;
-      if(DebugPrint) Print("⚡ Squeeze detected");
+      if(DebugPrint) Print("⚡ Squeeze Active | Spread: ", spread);
    }
-   
+
+   // 3. MANAGE POSITIONS
+   if(currentTicket != 0) {
+      if(PositionSelectByTicket(currentTicket)) {
+         if(CloseOnAnyProfit && PositionGetDouble(POSITION_PROFIT) > 0) {
+            CloseTrade();
+         }
+         return; // Exit OnTick if trade is open
+      } else {
+         currentTicket = 0;
+      }
+   }
+
+   // 4. SIGNAL LOGIC
    if(squeezeDetected) {
-      if(IsBreakoutUp()) {
+      double closeCurrent = iClose(SymbolToTrade, PERIOD_M1, 0);
+      
+      if(closeCurrent > bb_upper[0]) {
          Print("🚀 BUY breakout");
          OpenTrade(1);
-         lastTradeTime = now;
-         squeezeDetected = false;
+         squeezeDetected = false; // Reset after trade
       }
-      else if(IsBreakoutDown()) {
+      else if(closeCurrent < bb_lower[0]) {
          Print("🔻 SELL breakout");
          OpenTrade(-1);
-         lastTradeTime = now;
-         squeezeDetected = false;
+         squeezeDetected = false; // Reset after trade
       }
    }
 }
