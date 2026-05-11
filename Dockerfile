@@ -20,245 +20,226 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                    IMPROVED SWEEP SCALPER (High Win Rate)       |
-//|                    Adds trend filter, reclaim confirmation, ATR |
+//|                  MICRO PROFIT SCALPER V5                        |
+//|          Fast exit + no SL + tiny profit harvesting             |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property strict
-#property version "4.0"
+#property version "5.0"
 
-input string   SymbolToTrade       = "EURUSD.vx";
-input double   FixedLot            = 0.01;          // Fixed lot size (adjust)
-input int      LookbackBars        = 8;
-input double   SweepPoints         = 2;             // Minimum points for sweep (increased for filter)
-input int      MinReclaimCandles   = 2;             // Wait for reclaim within this many bars
-input int      StopLossATR         = 1;             // Stop loss as ATR multiplier
-input int      TakeProfitATR       = 1.5;           // Take profit multiplier
-input int      ATRPeriod           = 14;
-input bool     CloseOnProfit       = true;
-input double   MinProfitUSD        = 0.50;          // Minimum profit to close (overcomes spread)
-input bool     UseTrendFilter      = true;
-input int      TrendMAPeriod       = 200;           // EMA for trend (M5)
-input bool     UseSessionFilter    = true;
-input int      SessionStartHour    = 8;             // London open (GMT)
-input int      SessionEndHour      = 16;            // NY close
-input int      MaxDailyLossPercent = 5.0;
-input int      MaxConsecutiveLosses = 3;
-input int      MaxPositions        = 2;             // Reduced to avoid overexposure
-input int      MagicNumber         = 777999;
-input bool     DebugPrint          = true;
+input string SymbolToTrade = "EURUSD.vx";
+
+input double FixedLot = 0.01;
+
+input int LookbackBars = 6;
+input double SweepPoints = 1;
+
+input double ProfitCloseUSD = 0.15;
+input double EmergencyLossUSD = -3.0;
+
+input int CooldownSeconds = 20;
+
+input bool UseTrendFilter = true;
+input int EMA_Period = 50;
+
+input int MaxSpreadPoints = 25;
+
+input int MagicNumber = 777999;
+
+input bool DebugPrint = true;
 
 CTrade trade;
+
 double point;
-int atrHandle, trendMaHandle;
-bool tradingEnabled = true;
-double dailyStartEquity = 0;
-datetime dayStart = 0;
-int consecutiveLosses = 0;
+datetime lastTradeTime = 0;
 
 //+------------------------------------------------------------------+
-int CountPositions()
+bool HasOpenPosition()
 {
-   int total = 0;
    for(int i=PositionsTotal()-1; i>=0; i--)
    {
       ulong ticket = PositionGetTicket(i);
+
       if(PositionSelectByTicket(ticket))
+      {
          if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
             PositionGetString(POSITION_SYMBOL) == SymbolToTrade)
-            total++;
+         {
+            return true;
+         }
+      }
    }
-   return total;
+
+   return false;
 }
 
 //+------------------------------------------------------------------+
-bool IsTradingTime()
+void ManagePosition()
 {
-   if(!UseSessionFilter) return true;
-   MqlDateTime dt;
-   TimeCurrent(dt);
-   return (dt.hour >= SessionStartHour && dt.hour < SessionEndHour);
-}
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
 
-//+------------------------------------------------------------------+
-bool IsTrendUp()
-{
-   if(!UseTrendFilter) return true;
-   double ma[];
-   ArraySetAsSeries(ma, true);
-   if(CopyBuffer(trendMaHandle, 0, 0, 1, ma) < 1) return true;
-   double currentPrice = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-   return (currentPrice > ma[0]);
-}
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+            continue;
 
-bool IsTrendDown()
-{
-   if(!UseTrendFilter) return true;
-   double ma[];
-   ArraySetAsSeries(ma, true);
-   if(CopyBuffer(trendMaHandle, 0, 0, 1, ma) < 1) return true;
-   double currentPrice = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-   return (currentPrice < ma[0]);
-}
+         double profit = PositionGetDouble(POSITION_PROFIT);
 
-//+------------------------------------------------------------------+
-double GetATR()
-{
-   double atr[];
-   ArraySetAsSeries(atr, true);
-   if(CopyBuffer(atrHandle, 0, 0, 1, atr) < 1) return 10 * point;
-   return atr[0];
+         // FAST PROFIT GRAB
+         if(profit >= ProfitCloseUSD)
+         {
+            trade.PositionClose(ticket);
+
+            Print("💰 QUICK PROFIT CLOSED: ", profit);
+         }
+
+         // EMERGENCY FLOATING LOSS EXIT
+         if(profit <= EmergencyLossUSD)
+         {
+            trade.PositionClose(ticket);
+
+            Print("🛑 EMERGENCY LOSS CLOSED: ", profit);
+         }
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
 double GetLowestLow()
 {
    double low = DBL_MAX;
+
    for(int i=2; i<=LookbackBars; i++)
-      low = MathMin(low, iLow(SymbolToTrade, PERIOD_M1, i));
+   {
+      double l = iLow(SymbolToTrade, PERIOD_M1, i);
+
+      if(l < low)
+         low = l;
+   }
+
    return low;
 }
 
+//+------------------------------------------------------------------+
 double GetHighestHigh()
 {
    double high = -DBL_MAX;
+
    for(int i=2; i<=LookbackBars; i++)
-      high = MathMax(high, iHigh(SymbolToTrade, PERIOD_M1, i));
+   {
+      double h = iHigh(SymbolToTrade, PERIOD_M1, i);
+
+      if(h > high)
+         high = h;
+   }
+
    return high;
 }
 
 //+------------------------------------------------------------------+
-bool SweepBuyConfirmed()
+bool TrendBuyAllowed()
 {
-   // Static variables to track sweep state across ticks
-   static bool awaitingReclaim = false;
-   static double sweepLow = 0;
-   static datetime sweepTime = 0;
-   
-   double currentLow = iLow(SymbolToTrade, PERIOD_M1, 0);
-   double lowestLow = GetLowestLow();
-   
-   // Detect new sweep
-   if(!awaitingReclaim && currentLow <= lowestLow - SweepPoints * point)
-   {
-      awaitingReclaim = true;
-      sweepLow = lowestLow;
-      sweepTime = TimeCurrent();
-      if(DebugPrint) Print("Sweep detected at low ", currentLow);
-   }
-   
-   // Reclaim condition: price must close back above sweepLow within MinReclaimCandles bars
-   if(awaitingReclaim && (TimeCurrent() - sweepTime) <= MinReclaimCandles * 60)
-   {
-      double close = iClose(SymbolToTrade, PERIOD_M1, 0);
-      if(close > sweepLow)
-      {
-        ﻿awaitingReclaim = false;
-        if(DebugPrint) Print("Reclaim confirmed. Buy signal.");
-        return true;
-      }
-   }
-   // Timeout
-   if(awaitingReclaim && (TimeCurrent() - sweepTime) > MinReclaimCandles * 60)
-      awaitingReclaim = false;
-   
-   return false;
+   if(!UseTrendFilter)
+      return true;
+
+   double ema = iMA(
+      SymbolToTrade,
+      PERIOD_M5,
+      EMA_Period,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   double price = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+
+   return price > ema;
 }
 
-bool SweepSellConfirmed()
+//+------------------------------------------------------------------+
+bool TrendSellAllowed()
 {
-   static bool awaitingReclaim = false;
-   static double sweepHigh = 0;
-   static datetime sweepTime = 0;
-   
-   double currentHigh = iHigh(SymbolToTrade, PERIOD_M1, 0);
-   double highestHigh = GetHighestHigh();
-   
-   if(!awaitingReclaim && currentHigh >= highestHigh + SweepPoints * point)
-   {
-      awaitingReclaim = true;
-      sweepHigh = highestHigh;
-      sweepTime = TimeCurrent();
-      if(DebugPrint) Print("Sweep detected at high ", currentHigh);
-   }
-   
-   if(awaitingReclaim && (TimeCurrent() - sweepTime) <= MinReclaimCandles * 60)
-   {
-      double close = iClose(SymbolToTrade, PERIOD_M1, 0);
-      if(close < sweepHigh)
-      {
-         awaitingReclaim = false;
-         if(DebugPrint) Print("Reclaim confirmed. Sell signal.");
-         return true;
-      }
-   }
-   if(awaitingReclaim && (TimeCurrent() - sweepTime) > MinReclaimCandles * 60)
-      awaitingReclaim = false;
-   
-   return false;
+   if(!UseTrendFilter)
+      return true;
+
+   double ema = iMA(
+      SymbolToTrade,
+      PERIOD_M5,
+      EMA_Period,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   double price = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+
+   return price < ema;
+}
+
+//+------------------------------------------------------------------+
+bool SpreadOK()
+{
+   double spread =
+      (SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK) -
+       SymbolInfoDouble(SymbolToTrade, SYMBOL_BID)) / point;
+
+   return spread <= MaxSpreadPoints;
 }
 
 //+------------------------------------------------------------------+
 void OpenBuy()
 {
    double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-   double atr = GetATR();
-   double sl_pips = atr / point * StopLossATR;
-   double tp_pips = atr / point * TakeProfitATR;
-   
-   // Ensure minimum stop distance
-   int stopsLevel = (int)SymbolInfoInteger(SymbolToTrade, SYMBOL_TRADE_STOPS_LEVEL);
-   double minSL = (stopsLevel + 2) * point;
-   if(sl_pips * point < minSL) sl_pips = minSL / point;
-   
-   double sl = ask - sl_pips * point;
-   double tp = ask + tp_pips * point;
-   
-   bool ok = trade.Buy(FixedLot, SymbolToTrade, ask, sl, tp, "Sweep Buy");
-   if(ok)
-      Print("🔥 BUY opened | SL=", sl, " TP=", tp);
-   else
-      Print("❌ BUY failed: ", trade.ResultRetcodeDescription());
-}
 
-void OpenSell()
-{
-   double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-   double atr = GetATR();
-   double sl_pips = atr / point * StopLossATR;
-   double tp_pips = atr / point * TakeProfitATR;
-   
-   int stopsLevel = (int)SymbolInfoInteger(SymbolToTrade, SYMBOL_TRADE_STOPS_LEVEL);
-   double minSL = (stopsLevel + 2) * point;
-   if(sl_pips * point < minSL) sl_pips = minSL / point;
-   
-   double sl = bid + sl_pips * point;
-   double tp = bid - tp_pips * point;
-   
-   bool ok = trade.Sell(FixedLot, SymbolToTrade, bid, sl, tp, "Sweep Sell");
+   bool ok = trade.Buy(
+      FixedLot,
+      SymbolToTrade,
+      ask,
+      0,
+      0,
+      "MICRO BUY"
+   );
+
    if(ok)
-      Print("🔥 SELL opened | SL=", sl, " TP=", tp);
+   {
+      lastTradeTime = TimeCurrent();
+
+      Print("🔥 BUY OPENED");
+   }
    else
-      Print("❌ SELL failed: ", trade.ResultRetcodeDescription());
+   {
+      Print("❌ BUY FAILED: ",
+            trade.ResultRetcodeDescription());
+   }
 }
 
 //+------------------------------------------------------------------+
-void ManagePositions()
+void OpenSell()
 {
-   for(int i=PositionsTotal()-1; i>=0; i--)
+   double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+
+   bool ok = trade.Sell(
+      FixedLot,
+      SymbolToTrade,
+      bid,
+      0,
+      0,
+      "MICRO SELL"
+   );
+
+   if(ok)
    {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-      {
-         double profit = PositionGetDouble(POSITION_PROFIT);
-         if(CloseOnProfit && profit >= MinProfitUSD)
-         {
-            trade.PositionClose(ticket);
-            Print("💰 Closed profit: ", profit);
-            consecutiveLosses = 0;
-         }
-      }
+      lastTradeTime = TimeCurrent();
+
+      Print("🔥 SELL OPENED");
+   }
+   else
+   {
+      Print("❌ SELL FAILED: ",
+            trade.ResultRetcodeDescription());
    }
 }
 
@@ -266,69 +247,70 @@ void ManagePositions()
 int OnInit()
 {
    trade.SetExpertMagicNumber(MagicNumber);
+
    trade.SetTypeFillingBySymbol(SymbolToTrade);
+
    SymbolSelect(SymbolToTrade, true);
+
    point = SymbolInfoDouble(SymbolToTrade, SYMBOL_POINT);
-   
-   atrHandle = iATR(SymbolToTrade, PERIOD_M1, ATRPeriod);
-   trendMaHandle = iMA(SymbolToTrade, PERIOD_M5, TrendMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
-   if(atrHandle == INVALID_HANDLE || trendMaHandle == INVALID_HANDLE) return INIT_FAILED;
-   
-   dayStart = TimeCurrent();
-   dailyStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   Print("====================================");
-   Print("IMPROVED SWEEP SCALPER STARTED");
-   Print("Symbol: ", SymbolToTrade, " Lot: ", FixedLot);
-   Print("====================================");
+
+   Print("================================");
+   Print("MICRO PROFIT SCALPER STARTED");
+   Print("================================");
+
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Daily loss reset
-   datetime now = TimeCurrent();
-   if(now - dayStart >= 86400)
+   ManagePosition();
+
+   if(HasOpenPosition())
+      return;
+
+   if(TimeCurrent() - lastTradeTime < CooldownSeconds)
+      return;
+
+   if(!SpreadOK())
+      return;
+
+   double lowestLow = GetLowestLow();
+   double highestHigh = GetHighestHigh();
+
+   double currentLow =
+      iLow(SymbolToTrade, PERIOD_M1, 0);
+
+   double currentHigh =
+      iHigh(SymbolToTrade, PERIOD_M1, 0);
+
+   bool buySweep =
+      currentLow < (lowestLow - SweepPoints * point);
+
+   bool sellSweep =
+      currentHigh > (highestHigh + SweepPoints * point);
+
+   if(DebugPrint)
    {
-      dayStart = now;
-      dailyStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-      tradingEnabled = true;
-      consecutiveLosses = 0;
+      Print(
+         "BUY=", buySweep,
+         " SELL=", sellSweep
+      );
    }
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lossPercent = (dailyStartEquity - equity) / dailyStartEquity * 100.0;
-   if(lossPercent >= MaxDailyLossPercent) tradingEnabled = false;
-   else if(lossPercent < MaxDailyLossPercent-2) tradingEnabled = true;
-   if(!tradingEnabled) return;
-   
-   if(consecutiveLosses >= MaxConsecutiveLosses) return;
-   if(!IsTradingTime()) return;
-   if(CountPositions() >= MaxPositions) return;
-   
-   ManagePositions();
-   
-   // Wait for sweep confirmation with trend filter
-   if(SweepBuyConfirmed() && IsTrendUp())
+
+   // BUY
+   if(buySweep && TrendBuyAllowed())
    {
       OpenBuy();
-      // After opening, we need to track if it closes in loss
-      // Simple: increment consecutiveLosses when a trade closes with negative profit.
-      // We'll handle that by checking after close: we can track tickets but for simplicity,
-      // we assume losses will be counted in ManagePositions loss detection. Add detection:
-      static ulong lastTicket = 0;
-      if(lastTicket != trade.ResultOrder()) {
-         // new trade opened, later we'll check profit at close. This is complex.
-         // For now rely on daily loss limit to stop after too many losses.
-      }
+      return;
    }
-   else if(SweepSellConfirmed() && IsTrendDown())
+
+   // SELL
+   if(sellSweep && TrendSellAllowed())
    {
       OpenSell();
+      return;
    }
-   
-   // Additional loss tracking: simple version: we'll skip consecutive loss feature for now,
-   // as it requires trade outcome detection which is doable but adds complexity.
-   // Instead we rely on daily loss limit and small fixed lot.
 }
 //+------------------------------------------------------------------+
 EOF
