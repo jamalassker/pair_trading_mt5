@@ -20,34 +20,33 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                        TripleConfluenceScalper.mq5|
-//|                     Trend + MACD + Engulfing + RSI scalping     |
-//|                     High win rate, tight risk, fast profit exit |
+//|                                        SimplifiedScalper_EA.mq5 |
+//|                     Trend + MACD + Pullback + Breakout          |
+//|                     Designed for frequent, high-probability trades |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
-#include <MovingAverages.mqh>
 
-#property copyright "Scalper Pro"
-#property version   "1.0"
+#property copyright "Simplified Scalper"
+#property version   "1.1"
 #property strict
 
 // --- INPUTS --------------------------------------------------------+
-input string   SymbolToTrade     = "EURUSD.vx";   // Symbol (use your broker's name)
-input double   RiskPercent       = 1.0;           // Risk per trade (1% of equity)
-input int      StopLossPips      = 10;            // Fixed stop loss in pips
-input int      TakeProfitPips    = 15;            // Fixed take profit in pips
-input int      LookbackBars      = 50;            // For EMA calculation
-input double   EMA_FastPeriod    = 25;            // Fast EMA for pullback entry
-input double   EMA_SlowPeriod    = 200;           // Slow EMA for trend filter
-input int      RSI_Period        = 14;            // RSI period
-input double   RSI_Threshold     = 50.0;          // RSI midline (above for long, below for short)
+input string   SymbolToTrade     = "EURUSD.vx";
+input double   RiskPercent       = 1.0;            // Risk per trade (1% of equity)
+input int      StopLossPips      = 10;
+input int      TakeProfitPips    = 15;
+input int      EMA_TrendPeriod   = 200;            // 5-min trend EMA
+input int      EMA_PullbackPeriod= 50;             // 1-min pullback EMA
+input int      RSI_Period        = 14;
+input double   RSI_LongThreshold = 55.0;           // Above this for long
+input double   RSI_ShortThreshold= 45.0;           // Below this for short
 input int      MACD_Fast         = 12;
 input int      MACD_Slow         = 26;
 input int      MACD_Signal       = 9;
-input int      ConsecutiveLossLimit = 3;          // Stop after N losses in a row
-input int      StartHour         = 8;             // London open (GMT)
-input int      EndHour           = 16;            // NY close (GMT)
-input double   MaxDailyLossPercent = 5.0;         // Daily equity loss limit
+input int      ConsecutiveLossLimit = 3;
+input int      StartHour         = 8;              // London open (GMT)
+input int      EndHour           = 16;             // NY close (GMT)
+input double   MaxDailyLossPercent = 5.0;
 input int      MagicNumber       = 999001;
 input bool     DebugPrint        = true;
 
@@ -63,105 +62,97 @@ ulong currentTicket = 0;
 datetime entryTime = 0;
 
 // Indicator handles
-int ma_handle_fast, ma_handle_slow;
+int ma_trend_handle, ma_pullback_handle;
 int macd_handle, rsi_handle;
-double fast_ema[], slow_ema[], macd_main[], macd_signal[], rsi_buf[];
+double trend_ema[], pullback_ema[], macd_main[], macd_signal[], rsi_buf[];
 
-//+------------------------------------------------------------------+
-//| Check trading hours                                             |
 //+------------------------------------------------------------------+
 bool IsTradingHours() {
    MqlDateTime dt;
    TimeCurrent(dt);
-   int hour = dt.hour;
-   return (hour >= StartHour && hour < EndHour);
+   return (dt.hour >= StartHour && dt.hour < EndHour);
 }
 
 //+------------------------------------------------------------------+
-//| Check if MACD histogram is expanding in given direction         |
-//+------------------------------------------------------------------+
-bool IsMACDExpanding(bool buy) {
-   if(CopyBuffer(macd_handle, 0, 0, 3, macd_main) < 3 ||
-      CopyBuffer(macd_handle, 1, 0, 3, macd_signal) < 3)
-      return false;
-   double hist0 = macd_main[0] - macd_signal[0];
-   double hist1 = macd_main[1] - macd_signal[1];
-   if(buy) return (hist0 > hist1 && hist0 > 0);
-   else    return (hist0 < hist1 && hist0 < 0);
-}
-
-//+------------------------------------------------------------------+
-//| Check if price is above/below slow EMA (trend filter)           |
+// Trend direction using 200 EMA on 5-min
 //+------------------------------------------------------------------+
 bool IsTrendUp() {
    double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-   if(CopyBuffer(ma_handle_slow, 0, 0, 1, slow_ema) < 1) return true;
-   return (bid > slow_ema[0]);
+   if(CopyBuffer(ma_trend_handle, 0, 0, 1, trend_ema) < 1) return true;
+   return (bid > trend_ema[0]);
 }
 bool IsTrendDown() {
    double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-   if(CopyBuffer(ma_handle_slow, 0, 0, 1, slow_ema) < 1) return false;
-   return (ask < slow_ema[0]);
+   if(CopyBuffer(ma_trend_handle, 0, 0, 1, trend_ema) < 1) return false;
+   return (ask < trend_ema[0]);
 }
 
 //+------------------------------------------------------------------+
-//| Check engulfing pattern and pullback to fast EMA                |
+// MACD condition: histogram positive and rising (long) or negative and falling (short)
 //+------------------------------------------------------------------+
-bool IsEngulfingPullback(bool buy) {
-   MqlRates rates[3];
-   if(CopyRates(SymbolToTrade, PERIOD_M1, 0, 3, rates) < 3) return false;
-   double fast_ema_val;
-   if(CopyBuffer(ma_handle_fast, 0, 0, 1, fast_ema) < 1) return false;
-   fast_ema_val = fast_ema[0];
-   double current_price = buy ? SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK) : SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-   // Pullback condition: price within 0.02% of fast EMA (adjust as needed)
-   bool near_ema = MathAbs(current_price - fast_ema_val) / fast_ema_val < 0.0002;
-   if(!near_ema) return false;
-   
-   // Engulfing condition
-   if(buy) {
-      return (rates[1].close < rates[1].open &&
-              rates[0].close > rates[0].open &&
-              rates[0].close > rates[1].high &&
-              rates[0].open < rates[1].low);
-   } else {
-      return (rates[1].close > rates[1].open &&
-              rates[0].close < rates[0].open &&
-              rates[0].close < rates[1].low &&
-              rates[0].open > rates[1].high);
-   }
+bool IsMACDBullish() {
+   if(CopyBuffer(macd_handle, 0, 0, 2, macd_main) < 2 ||
+      CopyBuffer(macd_handle, 1, 0, 2, macd_signal) < 2)
+      return false;
+   double hist0 = macd_main[0] - macd_signal[0];
+   double hist1 = macd_main[1] - macd_signal[1];
+   return (hist0 > 0 && hist0 > hist1);
+}
+bool IsMACDBearish() {
+   if(CopyBuffer(macd_handle, 0, 0, 2, macd_main) < 2 ||
+      CopyBuffer(macd_handle, 1, 0, 2, macd_signal) < 2)
+      return false;
+   double hist0 = macd_main[0] - macd_signal[0];
+   double hist1 = macd_main[1] - macd_signal[1];
+   return (hist0 < 0 && hist0 < hist1);
 }
 
 //+------------------------------------------------------------------+
-//| Check RSI condition                                             |
+// Price pullback to 50 EMA (1-min) within 0.05% tolerance
 //+------------------------------------------------------------------+
-bool IsRSIValid(bool buy) {
+bool IsPullbackToEMA(bool buy) {
+   double ema_val;
+   if(CopyBuffer(ma_pullback_handle, 0, 0, 1, ema_val) < 1) return false;
+   double current = buy ? SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK) : SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+   double tolerance = ema_val * 0.0005;   // 0.05% tolerance
+   return (MathAbs(current - ema_val) <= tolerance);
+}
+
+//+------------------------------------------------------------------+
+// Breakout condition: current 1-min close > previous high (long) or < previous low (short)
+//+------------------------------------------------------------------+
+bool IsBreakout(bool buy) {
+   MqlRates rates[2];
+   if(CopyRates(SymbolToTrade, PERIOD_M1, 0, 2, rates) < 2) return false;
+   if(buy) return (rates[0].close > rates[1].high);
+   else    return (rates[0].close < rates[1].low);
+}
+
+//+------------------------------------------------------------------+
+// RSI condition
+//+------------------------------------------------------------------+
+bool IsRSIBullish() {
    if(CopyBuffer(rsi_handle, 0, 0, 1, rsi_buf) < 1) return false;
-   if(buy) return (rsi_buf[0] > RSI_Threshold);
-   else    return (rsi_buf[0] < RSI_Threshold);
+   return (rsi_buf[0] > RSI_LongThreshold);
+}
+bool IsRSIBearish() {
+   if(CopyBuffer(rsi_handle, 0, 0, 1, rsi_buf) < 1) return false;
+   return (rsi_buf[0] < RSI_ShortThreshold);
 }
 
-//+------------------------------------------------------------------+
-//| Get entry signal                                                 |
 //+------------------------------------------------------------------+
 int GetSignal() {
-   // 1. Trend filter (higher timeframe, here we use current chart but slow EMA)
    bool uptrend = IsTrendUp();
    bool downtrend = IsTrendDown();
    if(!uptrend && !downtrend) return 0;
    
-   // 2. MACD expanding in direction of trend
-   if(uptrend && !IsMACDExpanding(true)) return 0;
-   if(downtrend && !IsMACDExpanding(false)) return 0;
-   
-   // 3. Engulfing pullback pattern
-   if(uptrend && IsEngulfingPullback(true) && IsRSIValid(true)) return 1;  // Buy
-   if(downtrend && IsEngulfingPullback(false) && IsRSIValid(false)) return -1; // Sell
+   if(uptrend && IsMACDBullish() && IsPullbackToEMA(true) && IsBreakout(true) && IsRSIBullish())
+      return 1;   // Buy
+   if(downtrend && IsMACDBearish() && IsPullbackToEMA(false) && IsBreakout(false) && IsRSIBearish())
+      return -1;  // Sell
    return 0;
 }
 
-//+------------------------------------------------------------------+
-//| Close existing trade if any                                      |
 //+------------------------------------------------------------------+
 void CloseCurrent() {
    if(currentTicket != 0 && PositionSelectByTicket(currentTicket)) {
@@ -172,8 +163,6 @@ void CloseCurrent() {
 }
 
 //+------------------------------------------------------------------+
-//| Open trade with fixed SL/TP                                      |
-//+------------------------------------------------------------------+
 void OpenTrade(int signal) {
    double point = SymbolInfoDouble(SymbolToTrade, SYMBOL_POINT);
    double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
@@ -183,19 +172,19 @@ void OpenTrade(int signal) {
    lot = MathMax(0.01, lot);
    lot = MathMin(lot, SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_MAX));
    
-   if(signal == 1) { // Buy
+   if(signal == 1) {
       double sl = ask - StopLossPips * point;
       double tp = ask + TakeProfitPips * point;
-      if(trade.Buy(lot, SymbolToTrade, ask, sl, tp, "TripleConfluence Buy")) {
+      if(trade.Buy(lot, SymbolToTrade, ask, sl, tp, "Scalp Buy")) {
          currentTicket = trade.ResultOrder();
          entryTime = TimeCurrent();
          Print("🔥 BUY opened. Lot=", lot, " SL=", sl, " TP=", tp);
       } else Print("❌ Buy failed. Error ", GetLastError());
    }
-   else if(signal == -1) { // Sell
+   else if(signal == -1) {
       double sl = bid + StopLossPips * point;
       double tp = bid - TakeProfitPips * point;
-      if(trade.Sell(lot, SymbolToTrade, bid, sl, tp, "TripleConfluence Sell")) {
+      if(trade.Sell(lot, SymbolToTrade, bid, sl, tp, "Scalp Sell")) {
          currentTicket = trade.ResultOrder();
          entryTime = TimeCurrent();
          Print("🔥 SELL opened. Lot=", lot, " SL=", sl, " TP=", tp);
@@ -204,24 +193,22 @@ void OpenTrade(int signal) {
 }
 
 //+------------------------------------------------------------------+
-//| Initialize indicators                                            |
-//+------------------------------------------------------------------+
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
    SymbolSelect(SymbolToTrade, true);
    
-   ma_handle_fast = iMA(SymbolToTrade, PERIOD_M1, (int)EMA_FastPeriod, 0, MODE_EMA, PRICE_CLOSE);
-   ma_handle_slow = iMA(SymbolToTrade, PERIOD_M5, (int)EMA_SlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   ma_trend_handle = iMA(SymbolToTrade, PERIOD_M5, EMA_TrendPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   ma_pullback_handle = iMA(SymbolToTrade, PERIOD_M1, EMA_PullbackPeriod, 0, MODE_EMA, PRICE_CLOSE);
    macd_handle = iMACD(SymbolToTrade, PERIOD_M1, MACD_Fast, MACD_Slow, MACD_Signal, PRICE_CLOSE);
    rsi_handle = iRSI(SymbolToTrade, PERIOD_M1, RSI_Period, PRICE_CLOSE);
    
-   if(ma_handle_fast == INVALID_HANDLE || ma_handle_slow == INVALID_HANDLE ||
+   if(ma_trend_handle == INVALID_HANDLE || ma_pullback_handle == INVALID_HANDLE ||
       macd_handle == INVALID_HANDLE || rsi_handle == INVALID_HANDLE)
       return INIT_FAILED;
    
-   ArraySetAsSeries(fast_ema, true);
-   ArraySetAsSeries(slow_ema, true);
+   ArraySetAsSeries(trend_ema, true);
+   ArraySetAsSeries(pullback_ema, true);
    ArraySetAsSeries(macd_main, true);
    ArraySetAsSeries(macd_signal, true);
    ArraySetAsSeries(rsi_buf, true);
@@ -229,16 +216,14 @@ int OnInit() {
    dayStart = TimeCurrent();
    dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    Print("==============================================");
-   Print("⚡ TRIPLE CONFLUENCE SCALPER");
+   Print("⚡ SIMPLIFIED TRIPLE CONFLUENCE SCALPER");
    Print("   Symbol: ", SymbolToTrade);
-   Print("   Risk: ", RiskPercent, "% per trade | SL: ", StopLossPips, " | TP: ", TakeProfitPips);
+   Print("   Risk: ", RiskPercent, "% | SL: ", StopLossPips, " | TP: ", TakeProfitPips);
    Print("   Trading hours: ", StartHour, ":00-", EndHour, ":00 GMT");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
    if(!IsTradingHours()) {
@@ -247,7 +232,6 @@ void OnTick() {
    }
    
    datetime now = TimeCurrent();
-   // Daily loss reset
    if(now - dayStart >= 86400) {
       dayStart = now;
       dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -265,12 +249,12 @@ void OnTick() {
    if(!tradingEnabled && lossPercent < MaxDailyLossPercent-2) tradingEnabled = true;
    if(!tradingEnabled) return;
    
-   // --- Manage existing position ---
+   // Manage existing position
    if(currentTicket != 0 && PositionSelectByTicket(currentTicket)) {
-      // Track profit for consecutive loss counting (after close)
-      return; // SL/TP already set, just wait
+      // SL/TP already set; just wait
+      return;
    }
-   // If ticket is 0 but position exists (unlikely), sync
+   // Sync if ticket lost
    if(currentTicket == 0 && PositionsTotal() > 0) {
       for(int i=PositionsTotal()-1; i>=0; i--) {
          ulong ticket = PositionGetTicket(i);
@@ -281,19 +265,13 @@ void OnTick() {
       }
    }
    
-   // --- Position closed: check if it was a loss ---
-   if(currentTicket == 0 && entryTime != 0) {
-      // We need to know if last trade was loss. Simpler: reset consec losses on profit target hit.
-      // For simplicity, we'll rely on daily loss limit and consecutive loss limit.
-      // Actually we can track last profit after close. But for now, just reset on profit.
-   }
+   if(currentTicket != 0) return;
    
-   if(currentTicket != 0) return; // still in trade
+   // Cooldown after a trade close (wait 5 seconds)
+   static datetime lastSignalTime = 0;
+   if(now - lastSignalTime < 5) return;
    
-   // --- Cooldown after a trade that closed (wait 5 seconds) ---
-   if(now - lastBar < 5) return;
-   
-   // --- New signal on new bar only (to avoid multiple trades per bar) ---
+   // One signal per minute bar
    datetime currentBar = iTime(SymbolToTrade, PERIOD_M1, 0);
    if(currentBar == lastBar) return;
    lastBar = currentBar;
@@ -301,27 +279,26 @@ void OnTick() {
    int signal = GetSignal();
    if(signal != 0 && consecutiveLosses < ConsecutiveLossLimit) {
       OpenTrade(signal);
-      if(currentTicket != 0) lastBar = TimeCurrent(); // reset bar check
+      if(currentTicket != 0) {
+         lastSignalTime = now;
+      }
    }
    
-   // Debug
    if(DebugPrint && now - lastDebug >= 60) {
       lastDebug = now;
-      Print("📊 Market: Bid=", SymbolInfoDouble(SymbolToTrade, SYMBOL_BID),
+      Print("📊 Bid=", SymbolInfoDouble(SymbolToTrade, SYMBOL_BID),
             " Ask=", SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK),
-            " Consecutive losses=", consecutiveLosses);
+            " Losses=", consecutiveLosses);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Deinitialization                                                 |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-   IndicatorRelease(ma_handle_fast);
-   IndicatorRelease(ma_handle_slow);
+   IndicatorRelease(ma_trend_handle);
+   IndicatorRelease(ma_pullback_handle);
    IndicatorRelease(macd_handle);
    IndicatorRelease(rsi_handle);
-   Print("EA removed. Daily loss: $", (dailyEquityStart - AccountInfoDouble(ACCOUNT_EQUITY)));
+   Print("EA removed.");
 }
 //+------------------------------------------------------------------+
 EOF
