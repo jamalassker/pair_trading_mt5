@@ -20,29 +20,43 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                    BB_Squeeze_Scalper_FIXED.mq5 |
-//|                     Fixed logic: squeeze detection + breakout   |
-//|                     Fast in/out with profit                     |
+//|                                      LiquiditySweepScalper.mq5   |
+//|                     Sweep + reclaim + reversal confirmation     |
+//|                     High win rate scalping on M1                |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Scalper Fixed"
-#property version   "1.1"
+#property copyright "Sweep Scalper"
+#property version   "1.0"
 #property strict
 
 // --- INPUTS --------------------------------------------------------+
 input string   SymbolToTrade     = "EURUSD.vx";
-input double   RiskPercent       = 1.0;            // % equity per trade (0.01 = 1%)
-input int      BB_Period         = 20;
-input double   BB_Deviation      = 2.0;
+input double   RiskPercent       = 1.0;            // % equity per trade
+input int      SweepPips         = 5;              // How many pips beyond swing to qualify as sweep
+input int      LookbackBars      = 20;             // Bars to detect swing highs/lows
+input int      MinReclaimBars    = 3;              // Max candles to wait for reclaim after sweep
+input double   StopLossPips      = 10;             // Fixed SL (pips)
+input double   TakeProfitPips    = 15;             // Fixed TP (pips) – if using fixed
+input bool     UseDynamicTP      = true;           // Use ATR-based TP
+input double   ATR_MultiplierTP  = 1.5;            // TP = ATR * multiplier
+input bool     UseDynamicSL      = false;          // Use ATR-based SL (otherwise fixed)
+input double   ATR_MultiplierSL  = 1.0;
 input int      ATR_Period        = 14;
-input int      StopLossATR       = 1;
-input int      TakeProfitATR     = 2;
-input bool     CloseOnAnyProfit  = true;
-input int      MagicNumber       = 999002;
-input int      StartHour         = 8;
-input int      EndHour           = 16;
+input bool     UseTrendFilter    = true;           // VWAP or MA trend filter
+input int      TrendMAPeriod     = 200;            // for trend filter (if no VWAP)
+input bool     UseVolumeFilter   = true;           // Volume spike confirmation
+input double   VolumeMultiplier  = 1.5;            // Sweep candle volume >= average * this
+input bool     UseRSIFilter      = true;
+input double   RSIOversold       = 25.0;           // For buy setup
+input double   RSIOverbought     = 75.0;           // For sell setup
+input int      RSI_Period        = 14;
+input bool     CloseOnAnyProfit  = true;           // Fast out as soon as profit > 0
+input int      MagicNumber       = 999333;
+input int      StartHour         = 8;              // London open
+input int      EndHour           = 16;             // NY close
 input double   MaxDailyLossPercent = 5.0;
+input int      ConsecutiveLossLimit = 3;
 input bool     DebugPrint        = true;
 
 // --- GLOBALS -------------------------------------------------------+
@@ -53,39 +67,160 @@ double dailyEquityStart = 0;
 int consecutiveLosses = 0;
 bool tradingEnabled = true;
 ulong currentTicket = 0;
-int bb_handle, atr_handle;
-double bb_upper[], bb_lower[], atr_values[];
-bool squeezeDetected = false;          // <-- ADDED
+datetime entryTime = 0;
+
+// Indicator handles
+int vwap_handle, ma_trend_handle, atr_handle, rsi_handle;
+double atr_buf[], rsi_buf[], vwap_buf[], ma_buf[];
+double point, pipsToPoints;
 
 //+------------------------------------------------------------------+
-bool IsTradingHours() {
+//| Helper functions                                                |
+//+------------------------------------------------------------------+
+bool IsTradingTime() {
    MqlDateTime dt;
    TimeCurrent(dt);
    return (dt.hour >= StartHour && dt.hour < EndHour);
 }
 
-//+------------------------------------------------------------------+
-// 2. REPLACED IsSqueeze() – more aggressive
-//+------------------------------------------------------------------+
-bool IsSqueeze() {
-   if(CopyBuffer(atr_handle, 0, 0, 1, atr_values) < 1)
-      return false;
-   double spread = bb_upper[0] - bb_lower[0];
-   return (spread < atr_values[0] * 2.5);
+double GetPipSize() {
+   double pip = 0.0001;
+   if(StringFind(SymbolToTrade, "JPY") >= 0) pip = 0.01;
+   if(StringFind(SymbolToTrade, "XAU") >= 0) pip = 0.01;
+   if(StringFind(SymbolToTrade, "BTC") >= 0) pip = 1.0;
+   return pip;
 }
 
 //+------------------------------------------------------------------+
-// 3. REPLACED breakout functions – used previous bar close
+//| Swing high / low detection                                      |
 //+------------------------------------------------------------------+
-bool IsBreakoutUp() {
-   double close1 = iClose(SymbolToTrade, PERIOD_M1, 1);
-   return (close1 > bb_upper[1]);
+double GetSwingLow() {
+   double low = DBL_MAX;
+   for(int i=1; i<=LookbackBars; i++) {
+      double l = iLow(SymbolToTrade, PERIOD_M1, i);
+      if(l < low) low = l;
+   }
+   return low;
 }
-bool IsBreakoutDown() {
-   double close1 = iClose(SymbolToTrade, PERIOD_M1, 1);
-   return (close1 < bb_lower[1]);
+double GetSwingHigh() {
+   double high = -DBL_MAX;
+   for(int i=1; i<=LookbackBars; i++) {
+      double h = iHigh(SymbolToTrade, PERIOD_M1, i);
+      if(h > high) high = h;
+   }
+   return high;
 }
 
+//+------------------------------------------------------------------+
+//| Check if price swept below swing low and reclaimed              |
+//+------------------------------------------------------------------+
+bool IsBuySetup() {
+   static datetime sweepBarTime = 0;
+   static double swingLow = 0;
+   static bool awaitingReclaim = false;
+   
+   // Update swing low on each new bar
+   double newLow = GetSwingLow();
+   if(newLow != swingLow) {
+      swingLow = newLow;
+      awaitingReclaim = false;
+   }
+   
+   // Detect sweep: low of current bar < swingLow - SweepPips * point
+   double currentLow = iLow(SymbolToTrade, PERIOD_M1, 0);
+   double sweepThreshold = swingLow - SweepPips * point;
+   if(!awaitingReclaim && currentLow < sweepThreshold) {
+      awaitingReclaim = true;
+      sweepBarTime = TimeCurrent();
+      if(DebugPrint) Print("📉 Sweep below swing low at ", currentLow);
+   }
+   
+   // Reclaim: close of any bar after sweep > swingLow within MinReclaimBars
+   if(awaitingReclaim && (TimeCurrent() - sweepBarTime) <= MinReclaimBars * 60) {
+      double close = iClose(SymbolToTrade, PERIOD_M1, 0);
+      if(close > swingLow) {
+         if(DebugPrint) Print("✅ Reclaim detected. Buy signal.");
+         awaitingReclaim = false;
+         return true;
+      }
+   }
+   // Timeout: reset
+   if(awaitingReclaim && (TimeCurrent() - sweepBarTime) > MinReclaimBars * 60) {
+      awaitingReclaim = false;
+   }
+   return false;
+}
+
+bool IsSellSetup() {
+   static datetime sweepBarTime = 0;
+   static double swingHigh = 0;
+   static bool awaitingReclaim = false;
+   
+   double newHigh = GetSwingHigh();
+   if(newHigh != swingHigh) {
+      swingHigh = newHigh;
+      awaitingReclaim = false;
+   }
+   
+   double currentHigh = iHigh(SymbolToTrade, PERIOD_M1, 0);
+   double sweepThreshold = swingHigh + SweepPips * point;
+   if(!awaitingReclaim && currentHigh > sweepThreshold) {
+      awaitingReclaim = true;
+      sweepBarTime = TimeCurrent();
+      if(DebugPrint) Print("📈 Sweep above swing high at ", currentHigh);
+   }
+   
+   if(awaitingReclaim && (TimeCurrent() - sweepBarTime) <= MinReclaimBars * 60) {
+      double close = iClose(SymbolToTrade, PERIOD_M1, 0);
+      if(close < swingHigh) {
+         if(DebugPrint) Print("✅ Reclaim detected. Sell signal.");
+         awaitingReclaim = false;
+         return true;
+      }
+   }
+   if(awaitingReclaim && (TimeCurrent() - sweepBarTime) > MinReclaimBars * 60) awaitingReclaim = false;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Filters                                                         |
+//+------------------------------------------------------------------+
+bool IsTrendBullish() {
+   if(!UseTrendFilter) return true;
+   // VWAP is preferred, but MT5 doesn't have built-in VWAP, so we use MA
+   if(CopyBuffer(ma_trend_handle, 0, 0, 1, ma_buf) < 1) return true;
+   double currentPrice = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+   return (currentPrice > ma_buf[0]);
+}
+bool IsTrendBearish() {
+   if(!UseTrendFilter) return true;
+   if(CopyBuffer(ma_trend_handle, 0, 0, 1, ma_buf) < 1) return true;
+   double currentPrice = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
+   return (currentPrice < ma_buf[0]);
+}
+
+bool IsVolumeSpike() {
+   if(!UseVolumeFilter) return true;
+   long volume = iVolume(SymbolToTrade, PERIOD_M1, 0);
+   double avgVolume = 0;
+   for(int i=1; i<=20; i++) avgVolume += iVolume(SymbolToTrade, PERIOD_M1, i);
+   avgVolume /= 20;
+   return (volume > avgVolume * VolumeMultiplier);
+}
+
+bool IsRSIBuy() {
+   if(!UseRSIFilter) return true;
+   if(CopyBuffer(rsi_handle, 0, 0, 1, rsi_buf) < 1) return true;
+   return (rsi_buf[0] < RSIOversold);
+}
+bool IsRSISell() {
+   if(!UseRSIFilter) return true;
+   if(CopyBuffer(rsi_handle, 0, 0, 1, rsi_buf) < 1) return true;
+   return (rsi_buf[0] > RSIOverbought);
+}
+
+//+------------------------------------------------------------------+
+//| Trade management                                                |
 //+------------------------------------------------------------------+
 void CloseTrade() {
    if(currentTicket != 0 && PositionSelectByTicket(currentTicket)) {
@@ -95,132 +230,151 @@ void CloseTrade() {
    }
 }
 
-//+------------------------------------------------------------------+
+double GetATR() {
+   if(CopyBuffer(atr_handle, 0, 0, 1, atr_buf) < 1) return 10 * point;
+   return atr_buf[0];
+}
+
 void OpenTrade(int direction) {
-   double point = SymbolInfoDouble(SymbolToTrade, SYMBOL_POINT);
    double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
    double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   
-   // 6. REPLACED lot calculation
-   double lot = 0.01 + (equity / 10000.0) * RiskPercent;
-   lot = NormalizeDouble(lot, 2);
+   double lot = NormalizeDouble(equity / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    lot = MathMin(lot, SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_MAX));
    
-   // Get current ATR
-   if(CopyBuffer(atr_handle, 0, 0, 1, atr_values) < 1) {
-      Print("ATR not ready");
-      return;
-   }
-   double atr_pips = atr_values[0] / point;
-   double sl_pips = atr_pips * StopLossATR;
-   double tp_pips = atr_pips * TakeProfitATR;
+   double sl_pips = StopLossPips;
+   double tp_pips = TakeProfitPips;
+   if(UseDynamicSL) sl_pips = GetATR() / point * ATR_MultiplierSL;
+   if(UseDynamicTP) tp_pips = GetATR() / point * ATR_MultiplierTP;
    
-   // Minimum stop distance
-   double min_dist = SymbolInfoInteger(SymbolToTrade, SYMBOL_TRADE_STOPS_LEVEL) * point;
-   if(sl_pips * point < min_dist) sl_pips = min_dist / point + point;
+   // Ensure minimum distance
+   int stopsLevel = (int)SymbolInfoInteger(SymbolToTrade, SYMBOL_TRADE_STOPS_LEVEL);
+   double minSL = (stopsLevel + 1) * point;
+   if(sl_pips * point < minSL) sl_pips = minSL / point;
    
    if(direction == 1) { // BUY
       double sl = ask - sl_pips * point;
       double tp = ask + tp_pips * point;
-      if(trade.Buy(lot, SymbolToTrade, ask, sl, tp, "BB Squeeze Buy")) {
+      if(trade.Buy(lot, SymbolToTrade, ask, sl, tp, "Liquidity Buy")) {
          currentTicket = trade.ResultOrder();
+         entryTime = TimeCurrent();
          Print("🔥 BUY | Lot=", lot, " SL=", sl, " TP=", tp);
       } else Print("❌ Buy failed. Error ", GetLastError());
    }
    else if(direction == -1) { // SELL
       double sl = bid + sl_pips * point;
       double tp = bid - tp_pips * point;
-      if(trade.Sell(lot, SymbolToTrade, bid, sl, tp, "BB Squeeze Sell")) {
+      if(trade.Sell(lot, SymbolToTrade, bid, sl, tp, "Liquidity Sell")) {
          currentTicket = trade.ResultOrder();
+         entryTime = TimeCurrent();
          Print("🔥 SELL | Lot=", lot, " SL=", sl, " TP=", tp);
       } else Print("❌ Sell failed. Error ", GetLastError());
    }
 }
 
 //+------------------------------------------------------------------+
+//| Expert initialization                                           |
+//+------------------------------------------------------------------+
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
-   // 4. REPLACED filling mode
    trade.SetTypeFillingBySymbol(SymbolToTrade);
    SymbolSelect(SymbolToTrade, true);
+   point = SymbolInfoDouble(SymbolToTrade, SYMBOL_POINT);
+   pipsToPoints = GetPipSize() / point;
    
-   bb_handle = iBands(SymbolToTrade, PERIOD_M1, BB_Period, 0, BB_Deviation, PRICE_CLOSE);
+   // Create indicators
+   ma_trend_handle = iMA(SymbolToTrade, PERIOD_M1, TrendMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
    atr_handle = iATR(SymbolToTrade, PERIOD_M1, ATR_Period);
-   if(bb_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE) return INIT_FAILED;
+   rsi_handle = iRSI(SymbolToTrade, PERIOD_M1, RSI_Period, PRICE_CLOSE);
+   if(ma_trend_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE || rsi_handle == INVALID_HANDLE)
+      return INIT_FAILED;
    
-   ArraySetAsSeries(bb_upper, true);
-   ArraySetAsSeries(bb_lower, true);
-   ArraySetAsSeries(atr_values, true);
+   ArraySetAsSeries(atr_buf, true);
+   ArraySetAsSeries(rsi_buf, true);
+   ArraySetAsSeries(ma_buf, true);
    
    dayStart = TimeCurrent();
    dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    Print("==============================================");
-   Print("⚡ BB SQUEEZE SCALPER (FIXED - trades now)");
+   Print("⚡ LIQUIDITY SWEEP SCALPER");
    Print("   Symbol: ", SymbolToTrade);
-   Print("   Risk: ", RiskPercent, "%");
-   Print("   Close on any profit: ", CloseOnAnyProfit);
+   Print("   Sweep pips: ", SweepPips, " | Risk: ", RiskPercent, "%");
+   Print("   Session: ", StartHour, "h - ", EndHour, "h");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-// ... (Your inputs remain the same)
-
+//| Tick handler                                                    |
+//+------------------------------------------------------------------+
 void OnTick() {
-   if(!IsTradingHours() || !tradingEnabled) {
+   if(!IsTradingTime()) {
       if(currentTicket != 0) CloseTrade();
       return;
    }
-
-   // 1. REFRESH DATA FIRST
-   // Copy 2 bars so we can check "previous" (1) and "current" (0)
-   if(CopyBuffer(bb_handle, 1, 0, 2, bb_upper) < 2 || 
-      CopyBuffer(bb_handle, 2, 0, 2, bb_lower) < 2 ||
-      CopyBuffer(atr_handle, 0, 0, 2, atr_values) < 2) {
-      return; 
+   
+   datetime now = TimeCurrent();
+   if(now - dayStart >= 86400) {
+      dayStart = now;
+      dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
+      tradingEnabled = true;
+      consecutiveLosses = 0;
+      Print("✅ New trading day");
    }
-
-   // 2. CHECK FOR SQUEEZE (Calculated on current data)
-   double spread = bb_upper[0] - bb_lower[0];
-   if(spread < atr_values[0] * 2.5) {
-      squeezeDetected = true;
-      if(DebugPrint) Print("⚡ Squeeze Active | Spread: ", spread);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double lossPercent = (dailyEquityStart - equity) / dailyEquityStart * 100.0;
+   if(lossPercent >= MaxDailyLossPercent) {
+      if(tradingEnabled) Print("🚨 Daily loss limit reached");
+      tradingEnabled = false;
+      return;
    }
-
-   // 3. MANAGE POSITIONS
-   if(currentTicket != 0) {
-      if(PositionSelectByTicket(currentTicket)) {
-         if(CloseOnAnyProfit && PositionGetDouble(POSITION_PROFIT) > 0) {
+   if(!tradingEnabled && lossPercent < MaxDailyLossPercent-2) tradingEnabled = true;
+   if(!tradingEnabled) return;
+   
+   // Manage open trade
+   if(currentTicket != 0 && PositionSelectByTicket(currentTicket)) {
+      if(CloseOnAnyProfit) {
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         if(profit > 0) {
             CloseTrade();
+            Print("✅ Closed on profit: $", profit);
+            consecutiveLosses = 0;
+            return;
          }
-         return; // Exit OnTick if trade is open
-      } else {
-         currentTicket = 0;
       }
+      return;
    }
-
-   // 4. SIGNAL LOGIC
-   if(squeezeDetected) {
-      double closeCurrent = iClose(SymbolToTrade, PERIOD_M1, 0);
-      
-      if(closeCurrent > bb_upper[0]) {
-         Print("🚀 BUY breakout");
-         OpenTrade(1);
-         squeezeDetected = false; // Reset after trade
-      }
-      else if(closeCurrent < bb_lower[0]) {
-         Print("🔻 SELL breakout");
-         OpenTrade(-1);
-         squeezeDetected = false; // Reset after trade
-      }
+   if(currentTicket != 0 && !PositionSelectByTicket(currentTicket)) currentTicket = 0;
+   if(currentTicket != 0) return;
+   
+   // Cooldown after trade close
+   static datetime lastTrade = 0;
+   if(now - lastTrade < 5) return;
+   
+   // Only check on new 1-minute bar
+   datetime currentBar = iTime(SymbolToTrade, PERIOD_M1, 0);
+   if(currentBar == lastBar) return;
+   lastBar = currentBar;
+   
+   // Get signal + filters
+   bool buySignal = IsBuySetup();
+   bool sellSignal = IsSellSetup();
+   if(buySignal && IsTrendBullish() && IsVolumeSpike() && IsRSIBuy()) {
+      OpenTrade(1);
+      lastTrade = now;
+   }
+   else if(sellSignal && IsTrendBearish() && IsVolumeSpike() && IsRSISell()) {
+      OpenTrade(-1);
+      lastTrade = now;
    }
 }
+
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-   IndicatorRelease(bb_handle);
+   IndicatorRelease(ma_trend_handle);
    IndicatorRelease(atr_handle);
+   IndicatorRelease(rsi_handle);
    Print("EA removed.");
 }
 //+------------------------------------------------------------------+
