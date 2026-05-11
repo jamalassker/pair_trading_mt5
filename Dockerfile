@@ -20,25 +20,25 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                    BB_Squeeze_Scalper.mq5       |
-//|                     Bollinger Bands squeeze + breakout          |
+//|                                    BB_Squeeze_Scalper_FIXED.mq5 |
+//|                     Fixed logic: squeeze detection + breakout   |
 //|                     Fast in/out with profit                     |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Scalper"
-#property version   "1.0"
+#property copyright "Scalper Fixed"
+#property version   "1.1"
 #property strict
 
 // --- INPUTS --------------------------------------------------------+
 input string   SymbolToTrade     = "EURUSD.vx";
-input double   RiskPercent       = 1.0;            // % equity per trade
-input int      BB_Period         = 20;             // Bollinger Bands period
-input double   BB_Deviation      = 2.0;            // Standard deviations
-input int      ATR_Period        = 14;             // For dynamic SL/TP
-input int      StopLossATR       = 1;              // Stop loss multiplier (e.g., 1 = 1x ATR)
-input int      TakeProfitATR     = 2;              // Take profit multiplier
-input bool     CloseOnAnyProfit  = true;           // Close as soon as profit > 0 (overrides TP)
+input double   RiskPercent       = 1.0;            // % equity per trade (0.01 = 1%)
+input int      BB_Period         = 20;
+input double   BB_Deviation      = 2.0;
+input int      ATR_Period        = 14;
+input int      StopLossATR       = 1;
+input int      TakeProfitATR     = 2;
+input bool     CloseOnAnyProfit  = true;
 input int      MagicNumber       = 999002;
 input int      StartHour         = 8;
 input int      EndHour           = 16;
@@ -55,6 +55,7 @@ bool tradingEnabled = true;
 ulong currentTicket = 0;
 int bb_handle, atr_handle;
 double bb_upper[], bb_lower[], atr_values[];
+bool squeezeDetected = false;          // <-- ADDED
 
 //+------------------------------------------------------------------+
 bool IsTradingHours() {
@@ -64,24 +65,25 @@ bool IsTradingHours() {
 }
 
 //+------------------------------------------------------------------+
+// 2. REPLACED IsSqueeze() – more aggressive
+//+------------------------------------------------------------------+
 bool IsSqueeze() {
+   if(CopyBuffer(atr_handle, 0, 0, 1, atr_values) < 1)
+      return false;
    double spread = bb_upper[0] - bb_lower[0];
-   // Simple: bandwidth less than 20% of middle band? but easier: compare to recent range
-   // For simplicity, we just check if current candle is inside bands (no breakout yet)
-   // Actually we want to detect when bands are narrow, then wait for breakout.
-   // We'll use a dynamic threshold: spread < 1.5 * ATR(14)
-   if(CopyBuffer(atr_handle, 0, 0, 1, atr_values) < 1) return false;
-   return (spread < atr_values[0] * 1.5);
+   return (spread < atr_values[0] * 2.5);
 }
 
 //+------------------------------------------------------------------+
+// 3. REPLACED breakout functions – used previous bar close
+//+------------------------------------------------------------------+
 bool IsBreakoutUp() {
-   double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-   return (ask > bb_upper[0]);
+   double close1 = iClose(SymbolToTrade, PERIOD_M1, 1);
+   return (close1 > bb_upper[1]);
 }
 bool IsBreakoutDown() {
-   double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-   return (bid < bb_lower[0]);
+   double close1 = iClose(SymbolToTrade, PERIOD_M1, 1);
+   return (close1 < bb_lower[1]);
 }
 
 //+------------------------------------------------------------------+
@@ -99,11 +101,14 @@ void OpenTrade(int direction) {
    double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
    double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lot = NormalizeDouble(equity / 1000.0 * (RiskPercent / 100.0), 2);
+   
+   // 6. REPLACED lot calculation
+   double lot = 0.01 + (equity / 10000.0) * RiskPercent;
+   lot = NormalizeDouble(lot, 2);
    lot = MathMax(0.01, lot);
    lot = MathMin(lot, SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_MAX));
    
-   // Get current ATR value (in pips)
+   // Get current ATR
    if(CopyBuffer(atr_handle, 0, 0, 1, atr_values) < 1) {
       Print("ATR not ready");
       return;
@@ -111,9 +116,10 @@ void OpenTrade(int direction) {
    double atr_pips = atr_values[0] / point;
    double sl_pips = atr_pips * StopLossATR;
    double tp_pips = atr_pips * TakeProfitATR;
-   // Ensure minimum stop distance (to avoid "invalid stop" error)
+   
+   // Minimum stop distance
    double min_dist = SymbolInfoInteger(SymbolToTrade, SYMBOL_TRADE_STOPS_LEVEL) * point;
-   if(sl_pips * point < min_dist) sl_pips = min_dist / point;
+   if(sl_pips * point < min_dist) sl_pips = min_dist / point + point;
    
    if(direction == 1) { // BUY
       double sl = ask - sl_pips * point;
@@ -136,7 +142,8 @@ void OpenTrade(int direction) {
 //+------------------------------------------------------------------+
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   // 4. REPLACED filling mode
+   trade.SetTypeFillingBySymbol(SymbolToTrade);
    SymbolSelect(SymbolToTrade, true);
    
    bb_handle = iBands(SymbolToTrade, PERIOD_M1, BB_Period, 0, BB_Deviation, PRICE_CLOSE);
@@ -150,7 +157,7 @@ int OnInit() {
    dayStart = TimeCurrent();
    dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    Print("==============================================");
-   Print("⚡ BB SQUEEZE SCALPER (Fast profit exit)");
+   Print("⚡ BB SQUEEZE SCALPER (FIXED - trades now)");
    Print("   Symbol: ", SymbolToTrade);
    Print("   Risk: ", RiskPercent, "%");
    Print("   Close on any profit: ", CloseOnAnyProfit);
@@ -194,35 +201,48 @@ void OnTick() {
             return;
          }
       }
-      return; // still open
+      return;
    }
-   // Clean up if position gone
    if(currentTicket != 0 && !PositionSelectByTicket(currentTicket)) currentTicket = 0;
    if(currentTicket != 0) return;
    
-   // --- Cooldown and bar check ---
+   // Cooldown and bar check
    static datetime lastTradeTime = 0;
-   if(now - lastTradeTime < 3) return;  // 3 sec cooldown
+   if(now - lastTradeTime < 3) return;
    datetime currentBar = iTime(SymbolToTrade, PERIOD_M1, 0);
    if(currentBar == lastBar) return;
    lastBar = currentBar;
    
-   // --- Get indicator data ---
+   // Get indicator data
    if(CopyBuffer(bb_handle, 1, 0, 1, bb_upper) < 1 ||
       CopyBuffer(bb_handle, 2, 0, 1, bb_lower) < 1) return;
    
-   // --- Identify squeeze ---
-   if(!IsSqueeze()) return;
-   
-   // --- Wait for breakout on next candle ---
-   // Instead of checking on same bar, we'll check if current price breaks out after squeeze.
-   if(IsBreakoutUp()) {
-      OpenTrade(1);
-      lastTradeTime = now;
+   // 7. ADDED debug print
+   if(DebugPrint) {
+      Print("Upper=", bb_upper[0],
+            " Lower=", bb_lower[0],
+            " Ask=", SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK));
    }
-   else if(IsBreakoutDown()) {
-      OpenTrade(-1);
-      lastTradeTime = now;
+   
+   // 5. REPLACED signal logic
+   if(IsSqueeze()) {
+      squeezeDetected = true;
+      if(DebugPrint) Print("⚡ Squeeze detected");
+   }
+   
+   if(squeezeDetected) {
+      if(IsBreakoutUp()) {
+         Print("🚀 BUY breakout");
+         OpenTrade(1);
+         lastTradeTime = now;
+         squeezeDetected = false;
+      }
+      else if(IsBreakoutDown()) {
+         Print("🔻 SELL breakout");
+         OpenTrade(-1);
+         lastTradeTime = now;
+         squeezeDetected = false;
+      }
    }
 }
 //+------------------------------------------------------------------+
