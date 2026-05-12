@@ -21,14 +21,14 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                      LiquiditySweep_CTrade.mq5   |
-//|                     Uses CTrade - proven working on your broker  |
+//|                     CTrade version - Handles error 4756 & retries|
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property copyright "LiquiditySweep"
-#property version   "4.00"
+#property version   "4.10"
 
-// --- INPUTS (same as your original aggressive settings) ---
+// --- INPUTS (aggressive settings) ---
 input double   RiskPercent       = 3.0;        // Risk per trade (3-5%)
 input int      StopLossPips      = 4;          // Stop Loss in pips
 input int      TakeProfitPips    = 5;          // Take Profit in pips
@@ -37,7 +37,7 @@ input int      EMAPeriod         = 20;
 input int      MaxDailyLoss      = 8;
 input bool     UseSessionFilter  = false;      // Change to true after testing
 input int      SessionOffset     = 0;
-input int      MaxOpenPositions  = 1;          // Only one position at a time
+input int      MaxOpenPositions  = 1;
 
 // --- GLOBALS ---
 CTrade trade;
@@ -47,6 +47,13 @@ int    emaHandle;
 double point, pipValue;
 datetime lastTickThrottle = 0;
 
+// Retry mechanism globals
+int    trade_retry_attempts = 0;
+datetime last_trade_attempt_time = 0;
+int    trade_filling_mode = ORDER_FILLING_IOC;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -57,32 +64,88 @@ int OnInit()
    emaHandle = iMA(_Symbol, PERIOD_M1, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
    if(emaHandle == INVALID_HANDLE) return INIT_FAILED;
    
+   // Detect broker's supported filling mode
+   int filling_modes = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((filling_modes & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      trade_filling_mode = ORDER_FILLING_IOC;
+   else if((filling_modes & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      trade_filling_mode = ORDER_FILLING_FOK;
+   else
+      trade_filling_mode = ORDER_FILLING_RETURN;
+   
    trade.SetExpertMagicNumber(magic);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);   // Proven working on your broker
+   trade.SetTypeFilling(trade_filling_mode);
    trade.SetDeviationInPoints(10);
    
    Print("========================================");
    Print("LIQUIDITY SWEEP SCALPER - CTrade Edition");
    Print("Symbol: ", _Symbol);
+   Print("Filling mode: ", trade_filling_mode);
    Print("StopLoss: ", StopLossPips, " pips, TP: ", TakeProfitPips, " pips");
    Print("========================================");
    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
+//| Trade execution with retry (handles error 4756)                  |
+//+------------------------------------------------------------------+
+bool TradeWithRetry(ENUM_ORDER_TYPE type, double volume, double price, double sl, double tp)
+{
+   // Limit to 5 retries maximum
+   if(trade_retry_attempts >= 5)
+   {
+      Print("Max retry attempts reached (5). Trade abandoned.");
+      trade_retry_attempts = 0;
+      return false;
+   }
+   
+   // Throttle: only attempt once per second
+   if(GetTickCount() - last_trade_attempt_time < 1000 && trade_retry_attempts > 0)
+      return false;
+   
+   bool result = false;
+   switch(type)
+   {
+      case ORDER_TYPE_BUY:
+         result = trade.Buy(volume, _Symbol, price, sl, tp);
+         break;
+      case ORDER_TYPE_SELL:
+         result = trade.Sell(volume, _Symbol, price, sl, tp);
+         break;
+   }
+   
+   if(!result)
+   {
+      int error = GetLastError();
+      trade_retry_attempts++;
+      last_trade_attempt_time = GetTickCount();
+      Print("Trade attempt ", trade_retry_attempts, " failed. Error: ", error, 
+            " | Retcode: ", trade.ResultRetcode(), 
+            " | Comment: ", trade.ResultComment());
+      return false;
+   }
+   
+   // Success! Reset retry counter
+   trade_retry_attempts = 0;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Tick handler                                                     |
+//+------------------------------------------------------------------+
 void OnTick()
 {
-   // Throttle to avoid excessive checks (2x per second is enough)
+   // Throttle to avoid excessive checks (2x per second)
    if(GetTickCount() - lastTickThrottle < 500) return;
    lastTickThrottle = GetTickCount();
    
-   // --- Daily loss counter reset ---
+   // Daily loss counter
    static datetime lastDay = 0;
    datetime today = iTime(_Symbol, PERIOD_D1, 0);
    if(today != lastDay) { dailyLoss = 0; lastDay = today; }
    if(dailyLoss >= MaxDailyLoss) return;
    
-   // --- Optional session filter (London/NY) ---
+   // Session filter (London/NY)
    if(UseSessionFilter)
    {
       MqlDateTime tm; TimeToStruct(TimeCurrent(), tm);
@@ -90,10 +153,10 @@ void OnTick()
       if(!((hour >= 7 && hour < 10) || (hour >= 12 && hour < 15))) return;
    }
    
-   // --- Limit one position ---
+   // Position limit
    if(PositionsTotal() >= MaxOpenPositions) return;
    
-   // --- Get rates for swing levels (closed bars only) ---
+   // Get rates for swing levels (closed bars)
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
    if(CopyRates(_Symbol, PERIOD_M1, 0, LookbackBars+2, rates) < LookbackBars+1) return;
@@ -108,23 +171,21 @@ void OnTick()
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    
-   // --- EMA value ---
+   // EMA
    double ema[1];
    if(CopyBuffer(emaHandle, 0, 0, 1, ema) < 1) return;
    double currentEMA = ema[0];
    
-   // --- SIGNAL CONDITIONS (exactly as before) ---
+   // --- SIGNAL CONDITIONS (aggressive sweep logic) ---
    bool buySignal = false, sellSignal = false;
    
-   // Buy: price swept below swingLow (current bar low < swingLow - 0.2 pips) AND ask returned above swingLow AND ask above EMA
    if(rates[0].low < swingLow - 0.2*pipValue && ask > swingLow && ask > currentEMA)
       buySignal = true;
    
-   // Sell: price spiked above swingHigh AND bid returned below swingHigh AND bid below EMA
    if(rates[0].high > swingHigh + 0.2*pipValue && bid < swingHigh && bid < currentEMA)
       sellSignal = true;
    
-   // --- Force trade fallback (every ~60 seconds if no trade) ---
+   // Force trade fallback
    static int forceCounter = 0;
    forceCounter++;
    if(forceCounter >= 120 && !buySignal && !sellSignal)
@@ -135,7 +196,7 @@ void OnTick()
       Print("Force signal triggered");
    }
    
-   // --- Debug output on chart ---
+   // Debug output
    string debug = StringFormat(
       "SwingH=%.5f SwingL=%.5f | BarH=%.5f BarL=%.5f | Bid=%.5f Ask=%.5f EMA=%.5f\n"
       "Sell: Sweep=%s Ret=%s EMA=%s | Buy: Sweep=%s Ret=%s EMA=%s\n"
@@ -149,36 +210,64 @@ void OnTick()
    
    if(!buySignal && !sellSignal) return;
    
-   // --- TRADE EXECUTION using CTrade ---
-   double point2pip = pipValue / point;   // points per pip (usually 10)
+   // --- Prepare trade parameters ---
+   double point2pip = pipValue / point;
    double sl_points = StopLossPips * point2pip;
    double tp_points = TakeProfitPips * point2pip;
    
    double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    
+   ENUM_ORDER_TYPE tradeType;
+   double price, sl, tp;
+   
    if(buySignal)
    {
-      double sl = ask - sl_points * point;
-      double tp = ask + tp_points * point;
-      if(trade.Buy(lot, _Symbol, ask, sl, tp, "SweepBuy"))
-         Print("🔥 BUY opened | Lot=", lot, " @ ", ask);
-      else
-         Print("❌ Buy failed. Error: ", GetLastError());
+      tradeType = ORDER_TYPE_BUY;
+      price = ask;
+      sl = ask - sl_points * point;
+      tp = ask + tp_points * point;
    }
-   else if(sellSignal)
+   else
    {
-      double sl = bid + sl_points * point;
-      double tp = bid - tp_points * point;
-      if(trade.Sell(lot, _Symbol, bid, sl, tp, "SweepSell"))
-         Print("🔥 SELL opened | Lot=", lot, " @ ", bid);
-      else
-         Print("❌ Sell failed. Error: ", GetLastError());
+      tradeType = ORDER_TYPE_SELL;
+      price = bid;
+      sl = bid + sl_points * point;
+      tp = bid - tp_points * point;
    }
+   
+   // --- Adjust SL/TP to meet broker minimum stop distance (prevents 4756 from invalid stops) ---
+   long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopDistance = stopsLevel * point;
+   double currentPrice = (tradeType == ORDER_TYPE_BUY) ? ask : bid;
+   
+   if(tradeType == ORDER_TYPE_BUY)
+   {
+      if(sl > currentPrice - minStopDistance) sl = currentPrice - minStopDistance;
+      if(tp < currentPrice + minStopDistance) tp = currentPrice + minStopDistance;
+   }
+   else
+   {
+      if(sl < currentPrice + minStopDistance) sl = currentPrice + minStopDistance;
+      if(tp > currentPrice - minStopDistance) tp = currentPrice - minStopDistance;
+   }
+   
+   // --- Execute with retry logic ---
+   bool tradePlaced = false;
+   for(int attempt = 0; attempt < 5 && !tradePlaced; attempt++)
+   {
+      tradePlaced = TradeWithRetry(tradeType, lot, price, sl, tp);
+      if(!tradePlaced && attempt < 4) Sleep(100);
+   }
+   
+   if(tradePlaced)
+      Print("🔥 Trade opened: ", EnumToString(tradeType), " Lot=", lot, " @ ", price);
+   else
+      Print("❌ All trade attempts failed.");
 }
 
 //+------------------------------------------------------------------+
-//| Track daily losses (from closed trades)                          |
+//| Track daily losses                                               |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
