@@ -21,238 +21,223 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
  
 //+------------------------------------------------------------------+
-//|                    ULTRA AGGRESSIVE SWEEP SCALPER               |
-//|                    Opens MANY trades on M1                      |
+//|                                      LiquiditySweepScalperEA.mq5 |
+//|                              Generated for $10 cent account usage|
 //+------------------------------------------------------------------+
-#include <Trade\Trade.mqh>
-
+#property copyright "ScalperEA"
+#property version   "1.00"
 #property strict
-#property version "3.0"
 
-input string   SymbolToTrade       = "EURUSD.vx";
-input double   FixedLot            = 0.01;
+input double   RiskPercent      = 2.0;       // Risk per trade (% of balance)
+input int      StopLossPips     = 5;         // Stop Loss in pips
+input int      TakeProfitPips   = 6;         // Take Profit in pips
+input int      SMAX_Length      = 10;        // Lookback for swing high/low
+input int      EMAPeriod        = 20;        // EMA period for trend filter
+input int      MaxDailyLoss     = 6;         // Max daily losses before stopping
+input bool     UseOnlyLondonNY  = true;      // Trade only London/NY session
 
-input int      LookbackBars        = 8;
-input double   SweepPoints         = 1;
-
-input int      StopLossPoints      = 120;
-input int      TakeProfitPoints    = 80;
-
-input bool     CloseOnAnyProfit    = true;
-input bool     AllowMultipleTrades = true;
-
-input int      MaxPositions        = 5;
-
-input int      MagicNumber         = 777999;
-
-input bool     DebugPrint          = true;
-
-CTrade trade;
-double point;
+double point, pipValue;
+int    magicNumber = 20250310;
+int    dailyLossCount = 0;
+datetime lastTradeTime = 0;
+bool   sessionActive = false;
 
 //+------------------------------------------------------------------+
-int CountPositions()
-{
-   int total = 0;
-
-   for(int i=PositionsTotal()-1; i>=0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-
-      if(PositionSelectByTicket(ticket))
-      {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
-            PositionGetString(POSITION_SYMBOL) == SymbolToTrade)
-         {
-            total++;
-         }
-      }
-   }
-
-   return total;
-}
-
-//+------------------------------------------------------------------+
-double GetLowestLow()
-{
-   double low = DBL_MAX;
-
-   for(int i=2; i<=LookbackBars; i++)
-   {
-      double l = iLow(SymbolToTrade, PERIOD_M1, i);
-
-      if(l < low)
-         low = l;
-   }
-
-   return low;
-}
-
-//+------------------------------------------------------------------+
-double GetHighestHigh()
-{
-   double high = -DBL_MAX;
-
-   for(int i=2; i<=LookbackBars; i++)
-   {
-      double h = iHigh(SymbolToTrade, PERIOD_M1, i);
-
-      if(h > high)
-         high = h;
-   }
-
-   return high;
-}
-
-//+------------------------------------------------------------------+
-void OpenBuy()
-{
-   double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-
-   double sl = ask - StopLossPoints * point;
-   double tp = ask + TakeProfitPoints * point;
-
-   bool ok = trade.Buy(
-      FixedLot,
-      SymbolToTrade,
-      ask,
-      sl,
-      tp,
-      "BUY SWEEP"
-   );
-
-   if(ok)
-   {
-      Print("🔥 BUY OPENED");
-   }
-   else
-   {
-      Print("❌ BUY FAILED: ", trade.ResultRetcode(),
-            " | ", trade.ResultRetcodeDescription());
-   }
-}
-
-//+------------------------------------------------------------------+
-void OpenSell()
-{
-   double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-
-   double sl = bid + StopLossPoints * point;
-   double tp = bid - TakeProfitPoints * point;
-
-   bool ok = trade.Sell(
-      FixedLot,
-      SymbolToTrade,
-      bid,
-      sl,
-      tp,
-      "SELL SWEEP"
-   );
-
-   if(ok)
-   {
-      Print("🔥 SELL OPENED");
-   }
-   else
-   {
-      Print("❌ SELL FAILED: ", trade.ResultRetcode(),
-            " | ", trade.ResultRetcodeDescription());
-   }
-}
-
-//+------------------------------------------------------------------+
-void ManagePositions()
-{
-   for(int i=PositionsTotal()-1; i>=0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-
-      if(PositionSelectByTicket(ticket))
-      {
-         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
-            continue;
-
-         double profit = PositionGetDouble(POSITION_PROFIT);
-
-         if(CloseOnAnyProfit && profit > 0)
-         {
-            trade.PositionClose(ticket);
-
-            Print("💰 CLOSED PROFIT: ", profit);
-         }
-      }
-   }
-}
-
+//| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   trade.SetExpertMagicNumber(MagicNumber);
-
-   trade.SetTypeFillingBySymbol(SymbolToTrade);
-
-   SymbolSelect(SymbolToTrade, true);
-
-   point = SymbolInfoDouble(SymbolToTrade, SYMBOL_POINT);
-
-   Print("================================");
-   Print("ULTRA SWEEP SCALPER STARTED");
-   Print("Symbol: ", SymbolToTrade);
-   Print("Point: ", point);
-   Print("================================");
-
+   point = SymbolInfoInteger(Symbol(), SYMBOL_POINT);
+   pipValue = (SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE)) * 10.0; // approx for 5-digit broker
+   if(point == 0.00001) pipValue *= 10; // adjust for 5-digit
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
 void OnTick()
 {
-   ManagePositions();
-
-   if(!AllowMultipleTrades)
+   // Reset daily loss counter at new day
+   static datetime lastDay = 0;
+   datetime today = iTime(Symbol(), PERIOD_D1, 0);
+   if(today != lastDay)
    {
-      if(CountPositions() > 0)
+      dailyLossCount = 0;
+      lastDay = today;
+   }
+   
+   // Check trading session
+   if(UseOnlyLondonNY)
+   {
+      datetime now = TimeCurrent();
+      MqlDateTime tm;
+      TimeToStruct(now, tm);
+      int hour = tm.hour;
+      if(!((hour >= 7 && hour < 10) || (hour >= 12 && hour < 15))) // London 7-10 GMT, NY 12-15 GMT
+      {
+         sessionActive = false;
          return;
+      }
+      sessionActive = true;
    }
+   else sessionActive = true;
+   
+   // Don't trade if daily loss limit reached
+   if(dailyLossCount >= MaxDailyLoss) return;
+   
+   // Avoid trading every tick – only on new bar open (M1)
+   static datetime lastBarTime = 0;
+   datetime barTime = iTime(Symbol(), PERIOD_M1, 0);
+   if(barTime == lastBarTime) return;
+   lastBarTime = barTime;
+   
+   // Check for existing positions
+   if(PositionSelect(Symbol())) return;
+   
+   // Get M1 rates
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   CopyRates(Symbol(), PERIOD_M1, 0, SMAX_Length+5, rates);
+   
+   // Compute swing high (last SMAX_Length bars, excluding current)
+   double swingHigh = 0;
+   int swingHighIdx = -1;
+   for(int i=1; i<=SMAX_Length; i++)
+   {
+      if(rates[i].high > swingHigh)
+      {
+         swingHigh = rates[i].high;
+         swingHighIdx = i;
+      }
+   }
+   
+   // Compute swing low
+   double swingLow = DBL_MAX;
+   for(int i=1; i<=SMAX_Length; i++)
+   {
+      if(rates[i].low < swingLow) swingLow = rates[i].low;
+   }
+   
+   // Get EMA 20 on M1
+   double ema[20];
+   CopyBuffer(iMA(Symbol(), PERIOD_M1, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE), 0, 1, 2, ema);
+   double currentEMA = ema[0];
+   double prevEMA = ema[1];
+   
+   // Current price
+   double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+   
+   // ---- SELL condition: sweep of swing high + rejection + price below EMA ----
+   bool sellSignal = false;
+   // Sweep: current high > swingHigh + 0.5 pip (to avoid noise)
+   if(rates[0].high > swingHigh + 0.5*point*10)
+   {
+      // Rejection: current close < swingHigh and close < open (bearish rejection)
+      if(rates[0].close < swingHigh && rates[0].close < rates[0].open)
+      {
+         // EMA filter: current price < EMA20 and EMA flat/sloping down
+         if(bid < currentEMA && currentEMA <= prevEMA + 0.1*point*10)
+         {
+            sellSignal = true;
+         }
+      }
+   }
+   
+   // ---- BUY condition: sweep of swing low + rejection + price above EMA ----
+   bool buySignal = false;
+   if(rates[0].low < swingLow - 0.5*point*10)
+   {
+      if(rates[0].close > swingLow && rates[0].close > rates[0].open)
+      {
+         if(ask > currentEMA && currentEMA >= prevEMA - 0.1*point*10)
+         {
+            buySignal = true;
+         }
+      }
+   }
+   
+   // Execute trades
+   double riskAmount = (AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent) / 100.0;
+   double slPoints = StopLossPips * 10.0;  // convert to points (1 pip = 10 points for 5-digit)
+   double tpPoints = TakeProfitPips * 10.0;
+   
+   if(sellSignal)
+   {
+      double sl = bid + slPoints * point;
+      double tp = bid - tpPoints * point;
+      Trade(Symbol(), OP_SELL, 0, riskAmount, sl, tp, "LiquiditySweep sell");
+   }
+   else if(buySignal)
+   {
+      double sl = ask - slPoints * point;
+      double tp = ask + tpPoints * point;
+      Trade(Symbol(), OP_BUY, 0, riskAmount, sl, tp, "LiquiditySweep buy");
+   }
+}
 
-   if(CountPositions() >= MaxPositions)
+//+------------------------------------------------------------------+
+//| Trade execution function                                         |
+//+------------------------------------------------------------------+
+void Trade(string sym, int cmd, double lot, double riskAmount, double sl, double tp)
+{
+   double price = (cmd == OP_BUY) ? SymbolInfoDouble(sym, SYMBOL_ASK) : SymbolInfoDouble(sym, SYMBOL_BID);
+   double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   
+   // Calculate lot size based on risk in account currency
+   double slDistance = MathAbs(price - sl);
+   double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   double lossPerLot = slDistance / tickSize * tickValue;
+   lot = NormalizeDouble(riskAmount / lossPerLot, 2);
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathRound(lot / step) * step;
+   if(lot < minLot) lot = minLot;
+   if(lot > maxLot) lot = maxLot;
+   
+   MqlTradeRequest req = {};
+   MqlTradeResult res = {};
+   req.action = TRADE_ACTION_DEAL;
+   req.symbol = sym;
+   req.volume = lot;
+   req.type = (cmd == OP_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.price = price;
+   req.sl = sl;
+   req.tp = tp;
+   req.deviation = 10;
+   req.type_filling = ORDER_FILLING_FOK;
+   req.magic = magicNumber;
+   req.comment = "ScalpEA";
+   
+   if(!OrderSend(req, res))
+   {
+      Print("OrderSend error: ", res.retcode);
       return;
-
-   double lowestLow = GetLowestLow();
-   double highestHigh = GetHighestHigh();
-
-   double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-   double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-
-   double currentLow = iLow(SymbolToTrade, PERIOD_M1, 0);
-   double currentHigh = iHigh(SymbolToTrade, PERIOD_M1, 0);
-
-   // VERY AGGRESSIVE BUY
-   bool buySweep =
-      currentLow < (lowestLow - SweepPoints * point);
-
-   // VERY AGGRESSIVE SELL
-   bool sellSweep =
-      currentHigh > (highestHigh + SweepPoints * point);
-
-   if(DebugPrint)
-   {
-      Print(
-         "LOW=", currentLow,
-         " LL=", lowestLow,
-         " HIGH=", currentHigh,
-         " HH=", highestHigh
-      );
    }
+   
+   // Track loss counter (will be updated on TradeTransaction)
+   Print("Trade opened: ", (cmd==OP_BUY?"BUY":"SELL"), " lot=", lot, " sl=", sl, " tp=", tp);
+}
 
-   if(buySweep)
+//+------------------------------------------------------------------+
+//| Track daily loss count                                           |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
-      OpenBuy();
-   }
-
-   if(sellSweep)
-   {
-      OpenSell();
+      long dealEntry = 0;
+      HistoryDealSelect(trans.deal);
+      if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+      {
+         double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+         if(profit < 0) dailyLossCount++;
+      }
    }
 }
 //+------------------------------------------------------------------+
