@@ -1,6 +1,7 @@
 FROM python:3.11-slim-bookworm
 
 USER root
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DISPLAY=:1
 ENV WINEPREFIX=/root/.wine
@@ -13,44 +14,64 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir mt5linux rpyc
-RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# Copy each .ex5 file – each COPY on a single line, no trailing backslash
-COPY "UNIVERSAL ARBITRAGE ENGINE PRO.ex5" "/root/UNIVERSAL ARBITRAGE ENGINE PRO.ex5"
-COPY "Liquidity-Grabber_Pro_fix by @forexrobot5.ex5" "/root/Liquidity-Grabber_Pro_fix by @forexrobot5.ex5"
+RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe \
+    -O /root/mt5setup.exe
 
-RUN cat > /entrypoint.sh << 'EOF'
+# Copy EA files
+COPY ["UNIVERSAL ARBITRAGE ENGINE PRO.ex5", "/root/UNIVERSAL ARBITRAGE ENGINE PRO.ex5"]
+COPY ["Liquidity-Grabber_Pro_fix by @forexrobot5.ex5", "/root/Liquidity-Grabber_Pro_fix by @forexrobot5.ex5"]
+
+RUN cat > /entrypoint.sh <<EOF
 #!/bin/bash
 set -e
+
 rm -rf /tmp/.X*
+
 Xvfb :1 -screen 0 1280x1024x24 -ac &
 sleep 2
+
 fluxbox &
+
 x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
+
 websockify --web=/usr/share/novnc 8080 0.0.0.0:5900 &
+
 wineboot --init
 sleep 5
+
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-[ ! -f "$MT5_EXE" ] && wine /root/mt5setup.exe /auto && sleep 90
-wine "$MT5_EXE" &
+
+if [ ! -f "\$MT5_EXE" ]; then
+    wine /root/mt5setup.exe /auto
+    sleep 90
+fi
+
+wine "\$MT5_EXE" &
 sleep 30
 
-DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
-[ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
-mkdir -p "$DATA_DIR/Experts"
+DATA_DIR=\$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
 
-# Copy each file – use quotes to handle spaces and @
-cp "/root/UNIVERSAL ARBITRAGE ENGINE PRO.ex5" "$DATA_DIR/Experts/"
-cp "/root/Liquidity-Grabber_Pro_fix by @forexrobot5.ex5" "$DATA_DIR/Experts/"
+if [ -z "\$DATA_DIR" ]; then
+    DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
+fi
 
-echo "✅ Copied EAs to $DATA_DIR/Experts/"
-ls -la "$DATA_DIR/Experts/"
+mkdir -p "\$DATA_DIR/Experts"
+
+cp "/root/UNIVERSAL ARBITRAGE ENGINE PRO.ex5" "\$DATA_DIR/Experts/"
+cp "/root/Liquidity-Grabber_Pro_fix by @forexrobot5.ex5" "\$DATA_DIR/Experts/"
+
+echo "✅ Copied EAs to \$DATA_DIR/Experts/"
+
+ls -la "\$DATA_DIR/Experts/"
 
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
+
 tail -f /dev/null
 EOF
 
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
 
 EXPOSE 8080 8001
+
 CMD ["/bin/bash", "/entrypoint.sh"]
