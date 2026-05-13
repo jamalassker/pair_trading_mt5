@@ -20,24 +20,24 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                      HFT_LiquiditySweep.mq5      |
-//|                           Aggressive HFT - Multiple positions    |
+//|                                      HFT_LiquiditySweep_FIXED.mq5|
+//|                     No "invalid stop" – works with zero SL/TP    |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property copyright "HFT Scalper"
-#property version   "5.00"
+#property version   "5.10"
 
-// --- HFT AGGRESSIVE INPUTS ---
-input double   RiskPercent       = 2.0;        // Per trade risk (lower because many trades)
-input int      StopLossPips      = 3;          // Very tight SL
-input int      TakeProfitPips    = 3;          // Very tight TP (1:1)
-input int      LookbackBars      = 3;          // Shorter lookback = more signals
+// --- INPUTS ---
+input double   RiskPercent       = 2.0;
+input int      StopLossPips      = 0;          // 0 = no stop loss
+input int      TakeProfitPips    = 0;          // 0 = no take profit
+input int      LookbackBars      = 3;
 input int      EMAPeriod         = 20;
-input int      MaxDailyLoss      = 20;         // High limit for aggressive trading
-input bool     UseSessionFilter  = false;      // No session filter – trade anytime
+input int      MaxDailyLoss      = 20;
+input bool     UseSessionFilter  = false;
 input int      SessionOffset     = 0;
-input int      MaxOpenPositions  = 10;         // Allow multiple positions
+input int      MaxOpenPositions  = 10;
 
 // --- GLOBALS ---
 CTrade trade;
@@ -45,299 +45,166 @@ int    magic = 20250405;
 int    dailyLoss = 0;
 int    emaHandle;
 double point, pipValue;
-datetime lastTradeTime = 0;
-
-// Retry mechanism
 int    retryCount = 0;
 datetime lastRetryTime = 0;
 
 //+------------------------------------------------------------------+
-//| Auto-adjust SL/TP to broker minimum                              |
-//+------------------------------------------------------------------+
-void AdjustStopLevel(double &sl, double &tp, double price, ENUM_ORDER_TYPE type)
-{
-   long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double minDist = stopsLevel * point;
-   if(minDist <= 0) minDist = 10 * point;
-   
-   if(type == ORDER_TYPE_BUY)
-   {
-      if(sl != 0 && price - sl < minDist) sl = price - minDist;
-      if(tp != 0 && tp - price < minDist) tp = price + minDist;
-   }
-   else
-   {
-      if(sl != 0 && sl - price < minDist) sl = price + minDist;
-      if(tp != 0 && price - tp < minDist) tp = price - minDist;
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Trade with retry (4756 handling)                                 |
+//| Trade execution – handles zero SL/TP correctly                   |
 //+------------------------------------------------------------------+
 bool TradeWithRetry(ENUM_ORDER_TYPE type, double volume, double price, double sl, double tp, string comment)
 {
-   if(retryCount >= 5)
-   {
-      retryCount = 0;
-      return false;
-   }
-
-   if(GetTickCount() - lastRetryTime < 1000 && retryCount > 0)
-      return false;
-
-   bool res = false;
-
-   if(type == ORDER_TYPE_BUY)
-      res = trade.Buy(volume, _Symbol, price, sl, tp, comment);
-   else
-      res = trade.Sell(volume, _Symbol, price, sl, tp, comment);
-
+   if(retryCount >= 5) { retryCount = 0; return false; }
+   if(GetTickCount() - lastRetryTime < 1000 && retryCount > 0) return false;
+   
+   // If sl or tp is zero, set them to 0.0 (no stop/take)
+   double use_sl = (sl == 0) ? 0.0 : sl;
+   double use_tp = (tp == 0) ? 0.0 : tp;
+   
+   bool res = (type == ORDER_TYPE_BUY) 
+              ? trade.Buy(volume, _Symbol, price, use_sl, use_tp, comment)
+              : trade.Sell(volume, _Symbol, price, use_sl, use_tp, comment);
+   
    if(!res)
    {
       retryCount++;
       lastRetryTime = GetTickCount();
+      Print("Trade attempt ", retryCount, " failed. Error: ", GetLastError(),
+            " | Retcode: ", trade.ResultRetcode(),
+            " | Comment: ", trade.ResultComment());
       return false;
    }
-
    retryCount = 0;
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| OnInit                                                           |
 //+------------------------------------------------------------------+
 int OnInit()
 {
    point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    pipValue = (digits == 5 || digits == 3) ? point * 10 : point;
-
+   
    emaHandle = iMA(_Symbol, PERIOD_M1, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
-   if(emaHandle == INVALID_HANDLE)
-      return INIT_FAILED;
-
-   // Detect filling mode
+   if(emaHandle == INVALID_HANDLE) return INIT_FAILED;
+   
    long modes = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
-
    ENUM_ORDER_TYPE_FILLING fillMode = ORDER_FILLING_IOC;
-
-   if((modes & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
-      fillMode = ORDER_FILLING_IOC;
-   else if((modes & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
-      fillMode = ORDER_FILLING_FOK;
-   else
-      fillMode = ORDER_FILLING_RETURN;
-
+   if((modes & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) fillMode = ORDER_FILLING_IOC;
+   else if((modes & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) fillMode = ORDER_FILLING_FOK;
+   else fillMode = ORDER_FILLING_RETURN;
+   
    trade.SetExpertMagicNumber(magic);
    trade.SetTypeFilling(fillMode);
    trade.SetDeviationInPoints(10);
-
+   
    Print("========================================");
-   Print("HFT LIQUIDITY SWEEP - AGGRESSIVE MODE");
+   Print("HFT LIQUIDITY SWEEP - NO STOP LOSS MODE");
    Print("Symbol: ", _Symbol);
-   Print("Max positions: ", MaxOpenPositions);
-   Print("StopLoss: ", StopLossPips, " pips, TP: ", TakeProfitPips, " pips");
+   Print("StopLossPips = ", StopLossPips, " (0 = no stop)");
+   Print("TakeProfitPips = ", TakeProfitPips, " (0 = no take)");
    Print("========================================");
-
    return INIT_SUCCEEDED;
 }
 
-//+------------------------------------------------------------------+
-//| OnTick - HFT: no throttle, multiple positions                    |
 //+------------------------------------------------------------------+
 void OnTick()
 {
    // Daily loss limit
    static datetime lastDay = 0;
-
    datetime today = iTime(_Symbol, PERIOD_D1, 0);
-
-   if(today != lastDay)
-   {
-      dailyLoss = 0;
-      lastDay = today;
-   }
-
-   if(dailyLoss >= MaxDailyLoss)
-      return;
-
-   // Session filter (optional)
+   if(today != lastDay) { dailyLoss = 0; lastDay = today; }
+   if(dailyLoss >= MaxDailyLoss) return;
+   
+   // Session filter
    if(UseSessionFilter)
    {
-      MqlDateTime tm;
-      TimeToStruct(TimeCurrent(), tm);
-
+      MqlDateTime tm; TimeToStruct(TimeCurrent(), tm);
       int hour = (tm.hour + SessionOffset) % 24;
-
-      if(!((hour >= 7 && hour < 10) || (hour >= 12 && hour < 15)))
-         return;
+      if(!((hour >= 7 && hour < 10) || (hour >= 12 && hour < 15))) return;
    }
-
-   // Check position limit
-   if(PositionsTotal() >= MaxOpenPositions)
-      return;
-
-   // Get rates (no throttle => check every tick)
+   
+   if(PositionsTotal() >= MaxOpenPositions) return;
+   
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-
-   if(CopyRates(_Symbol, PERIOD_M1, 0, LookbackBars + 2, rates) < LookbackBars + 1)
-      return;
-
-   double swingHigh = 0;
-   double swingLow  = DBL_MAX;
-
-   for(int i = 1; i <= LookbackBars; i++)
+   if(CopyRates(_Symbol, PERIOD_M1, 0, LookbackBars+2, rates) < LookbackBars+1) return;
+   
+   double swingHigh = 0, swingLow = DBL_MAX;
+   for(int i=1; i<=LookbackBars; i++)
    {
-      if(rates[i].high > swingHigh)
-         swingHigh = rates[i].high;
-
-      if(rates[i].low < swingLow)
-         swingLow = rates[i].low;
+      if(rates[i].high > swingHigh) swingHigh = rates[i].high;
+      if(rates[i].low  < swingLow)  swingLow  = rates[i].low;
    }
-
+   
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
+   
    double ema[1];
-
-   if(CopyBuffer(emaHandle, 0, 0, 1, ema) < 1)
-      return;
-
+   if(CopyBuffer(emaHandle, 0, 0, 1, ema) < 1) return;
    double currentEMA = ema[0];
-
-   // --- HFT: LOOSENED SIGNALS ---
-   bool buySignal = false;
-   bool sellSignal = false;
-
-   // Buy
-   if(rates[0].low < swingLow - 0.1 * pipValue && ask > swingLow)
-      buySignal = true;
-
-   // Sell
-   if(rates[0].high > swingHigh + 0.1 * pipValue && bid < swingHigh)
-      sellSignal = true;
-
-   // Force trade aggressively
+   
+   bool buySignal = false, sellSignal = false;
+   if(rates[0].low < swingLow - 0.1*pipValue && ask > swingLow) buySignal = true;
+   if(rates[0].high > swingHigh + 0.1*pipValue && bid < swingHigh) sellSignal = true;
+   
    static int forceCounter = 0;
-
    forceCounter++;
-
    if(forceCounter >= 30 && !buySignal && !sellSignal)
    {
       forceCounter = 0;
-
-      if(ask > currentEMA)
-         buySignal = true;
-      else
-         sellSignal = true;
+      if(ask > currentEMA) buySignal = true;
+      else sellSignal = true;
    }
-
-   Comment(
-      StringFormat(
-         "HFT Mode | SwingH=%.5f SwingL=%.5f | Buy=%s Sell=%s | Positions=%d",
-         swingHigh,
-         swingLow,
-         buySignal ? "★" : "-",
-         sellSignal ? "★" : "-",
-         PositionsTotal()
-      )
-   );
-
-   if(!buySignal && !sellSignal)
-      return;
-
-   // --- Trade execution ---
-   double point2pip = pipValue / point;
-
-   double sl_points = StopLossPips * point2pip;
-   double tp_points = TakeProfitPips * point2pip;
-
-   double lot = NormalizeDouble(
-      AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0),
-      2
-   );
-
+   
+   Comment(StringFormat("HFT | SwingH=%.5f SwingL=%.5f | Buy=%s Sell=%s | Positions=%d",
+         swingHigh, swingLow, buySignal?"★":"-", sellSignal?"★":"-", PositionsTotal()));
+   
+   if(!buySignal && !sellSignal) return;
+   
+   // --- Calculate lot ---
+   double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
-
+   
    ENUM_ORDER_TYPE tradeType;
-
-   double price;
-   double sl;
-   double tp;
-
+   double price, sl = 0, tp = 0;
    string comment;
-
+   
    if(buySignal)
    {
       tradeType = ORDER_TYPE_BUY;
-
       price = ask;
-
-      sl = ask - sl_points * point;
-      tp = ask + tp_points * point;
-
+      if(StopLossPips > 0) sl = ask - StopLossPips * pipValue;
+      if(TakeProfitPips > 0) tp = ask + TakeProfitPips * pipValue;
       comment = "HFT_Buy";
    }
    else
    {
       tradeType = ORDER_TYPE_SELL;
-
       price = bid;
-
-      sl = bid + sl_points * point;
-      tp = bid - tp_points * point;
-
+      if(StopLossPips > 0) sl = bid + StopLossPips * pipValue;
+      if(TakeProfitPips > 0) tp = bid - TakeProfitPips * pipValue;
       comment = "HFT_Sell";
    }
-
-   // Enforce broker minimum stop distance
-   AdjustStopLevel(sl, tp, price, tradeType);
-
-   // Execute with retry
+   
+   // Execute with retry (SL/TP will be 0 if inputs are zero)
    bool placed = false;
-
-   for(int attempt = 0; attempt < 5 && !placed; attempt++)
+   for(int attempt=0; attempt<5 && !placed; attempt++)
    {
       placed = TradeWithRetry(tradeType, lot, price, sl, tp, comment);
-
-      if(!placed && attempt < 4)
-         Sleep(50);
+      if(!placed && attempt<4) Sleep(50);
    }
-
-   if(placed)
-   {
-      Print(
-         "🔥 HFT Trade: ",
-         EnumToString(tradeType),
-         " Lot=",
-         lot,
-         " @ ",
-         price
-      );
-   }
+   if(placed) Print("🔥 Trade: ", EnumToString(tradeType), " Lot=", lot, " @ ", price);
 }
-
 //+------------------------------------------------------------------+
-//| Track daily losses                                               |
-//+------------------------------------------------------------------+
-void OnTradeTransaction(
-   const MqlTradeTransaction &trans,
-   const MqlTradeRequest &request,
-   const MqlTradeResult &result
-)
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
 {
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
       ulong deal = trans.deal;
-
-      if(HistoryDealSelect(deal) &&
-         HistoryDealGetInteger(deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
-      {
-         if(HistoryDealGetDouble(deal, DEAL_PROFIT) < 0)
-            dailyLoss++;
-      }
+      if(HistoryDealSelect(deal) && HistoryDealGetInteger(deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+         if(HistoryDealGetDouble(deal, DEAL_PROFIT) < 0) dailyLoss++;
    }
 }
 //+------------------------------------------------------------------+
