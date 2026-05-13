@@ -15,13 +15,10 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
 RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# Copy the .ex5 files – quote names with spaces
+# Copy each .ex5 file – each COPY on a single line, no trailing backslash
 COPY "UNIVERSAL ARBITRAGE ENGINE PRO.ex5" "/root/UNIVERSAL ARBITRAGE ENGINE PRO.ex5"
 COPY "Liquidity-Grabber_Pro_fix by @forexrobot5.ex5" "/root/Liquidity-Grabber_Pro_fix by @forexrobot5.ex5"
 
-# ============================================
-# ENTRYPOINT – copy .ex5 files, no compilation
-# ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
@@ -34,25 +31,19 @@ websockify --web=/usr/share/novnc 8080 0.0.0.0:5900 &
 wineboot --init
 sleep 5
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-if [ ! -f "$MT5_EXE" ]; then
-    wine /root/mt5setup.exe /auto
-    sleep 90
-fi
+[ ! -f "$MT5_EXE" ] && wine /root/mt5setup.exe /auto && sleep 90
 wine "$MT5_EXE" &
 sleep 30
 
-# Find the MQL5 folder (random terminal subfolder)
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
-if [ -z "$DATA_DIR" ]; then
-    DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
-fi
+[ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 mkdir -p "$DATA_DIR/Experts"
 
-# Copy both .ex5 files – handle spaces with quotes
+# Copy each file – use quotes to handle spaces and @
 cp "/root/UNIVERSAL ARBITRAGE ENGINE PRO.ex5" "$DATA_DIR/Experts/"
 cp "/root/Liquidity-Grabber_Pro_fix by @forexrobot5.ex5" "$DATA_DIR/Experts/"
 
-echo "✅ Copied EAs to: $DATA_DIR/Experts/"
+echo "✅ Copied EAs to $DATA_DIR/Experts/"
 ls -la "$DATA_DIR/Experts/"
 
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
