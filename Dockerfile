@@ -436,71 +436,30 @@ void ModifyPositionSLTP(ulong ticket,
 }
 
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Lot size calculation – MANUAL LOT ONLY                          |
+//+------------------------------------------------------------------+
 double CalculateLotSize(double atrValue, int orderType)
 {
+   // use ONLY manual fixed lot
    double lotSize = InpFixedLot;
 
-   if(InpUseAutoLot && InpRiskPercent > 0)
-   {
-      double balance =
-         AccountInfoDouble(ACCOUNT_BALANCE);
+   double minLot = SymbolInfoDouble(expertSymbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(expertSymbol, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(expertSymbol, SYMBOL_VOLUME_STEP);
 
-      double riskAmount =
-         balance * InpRiskPercent / 100.0;
-
-      double slDistance =
-         atrValue * InpATRMultiplierSL;
-
-      double tickVal =
-         SymbolInfoDouble(expertSymbol,
-                          SYMBOL_TRADE_TICK_VALUE);
-
-      double tickSiz =
-         SymbolInfoDouble(expertSymbol,
-                          SYMBOL_TRADE_TICK_SIZE);
-
-      if(slDistance > 0 &&
-         tickSiz > 0 &&
-         tickVal > 0)
-      {
-         double slTicks =
-            slDistance / tickSiz;
-
-         lotSize =
-            riskAmount /
-            (slTicks * tickVal);
-      }
-   }
-
-   double step =
-      SymbolInfoDouble(expertSymbol,
-                       SYMBOL_VOLUME_STEP);
-
-   double minLot =
-      SymbolInfoDouble(expertSymbol,
-                       SYMBOL_VOLUME_MIN);
-
-   double maxLot =
-      SymbolInfoDouble(expertSymbol,
-                       SYMBOL_VOLUME_MAX);
-
-   lotSize =
-      MathFloor(lotSize / step) * step;
-
-   int digits = 2;
-
-   if(step == 1.0) digits = 0;
-   else if(step == 0.1) digits = 1;
-   else if(step == 0.01) digits = 2;
-   else if(step == 0.001) digits = 3;
-
-   lotSize = NormalizeDouble(lotSize, digits);
-
+   // keep inside broker limits
    if(lotSize < minLot)
       lotSize = minLot;
 
    if(lotSize > maxLot)
       lotSize = maxLot;
+
+   // normalize to broker step
+   if(step > 0)
+      lotSize = MathFloor(lotSize / step) * step;
+
+   lotSize = NormalizeDouble(lotSize, 2);
 
    return lotSize;
 }
