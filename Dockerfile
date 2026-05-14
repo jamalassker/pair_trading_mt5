@@ -19,7 +19,7 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
     -O /root/mt5setup.exe
 
 # ============================================================
-# AGGRESSIVE MICRO SCALPER EA – opens many trades
+# AGGRESSIVE MICRO SCALPER EA – fixed error 10016
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
@@ -27,7 +27,7 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //|                              High-frequency scalper for small acc|
 //+------------------------------------------------------------------+
 #property copyright "Aggressive Scalper EA"
-#property version   "2.00"
+#property version   "2.01"
 #property strict
 
 // --- Inputs (aggressive defaults) ---
@@ -127,7 +127,7 @@ void OnTick()
    // --- safety & limits ---
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
-   if(!SymbolInfoInteger(expertSymbol, SYMBOL_TRADE_MODE)) return;  // FIXED
+   if(!SymbolInfoInteger(expertSymbol, SYMBOL_TRADE_MODE)) return;
    if(drawdownLimitHit) return;
    if(CheckDailyLossLimit()) return;
    if(CheckDrawdownLimit()) return;
@@ -153,22 +153,20 @@ void OnTick()
    // --- signal generation (very relaxed) ---
    bool buySignal = false, sellSignal = false;
    
-   // UPTREND: buy if RSI is not overbought or if price just above fast EMA
    if(trend == 1 || (InpIgnoreTrendThreshold && fastEMA > slowEMA))
    {
       double price = SymbolInfoDouble(expertSymbol, SYMBOL_BID);
       double emaDistance = MathAbs(price - fastEMA) / pointValue;
-      double maxDistance = InpIgnoreTrendThreshold ? 100 : (atrValue / pointValue); // huge distance
+      double maxDistance = InpIgnoreTrendThreshold ? 100 : (atrValue / pointValue);
       
       if(emaDistance <= maxDistance &&
-         (rsiValue < InpRSIOverbought || rsiValue < 60) &&  // buy unless very overbought
-         rsi[1] <= rsi[0])                                 // non-falling RSI
+         (rsiValue < InpRSIOverbought || rsiValue < 60) &&
+         rsi[1] <= rsi[0])
       {
          buySignal = true;
       }
    }
    
-   // DOWNTREND: sell if RSI is not oversold
    if(trend == -1 || (InpIgnoreTrendThreshold && fastEMA < slowEMA))
    {
       double price = SymbolInfoDouble(expertSymbol, SYMBOL_ASK);
@@ -176,15 +174,15 @@ void OnTick()
       double maxDistance = InpIgnoreTrendThreshold ? 100 : (atrValue / pointValue);
       
       if(emaDistance <= maxDistance &&
-         (rsiValue > InpRSIOversold || rsiValue > 40) &&  // sell unless very oversold
-         rsi[1] >= rsi[0])                               // non-rising RSI
+         (rsiValue > InpRSIOversold || rsiValue > 40) &&
+         rsi[1] >= rsi[0])
       {
          sellSignal = true;
       }
    }
    
-   // --- execute trades aggressively (ignore cooldown) ---
-   if(buySignal && CountOpenPositions(ORDER_TYPE_BUY) < 2)  // allow 2 concurrent buys
+   // --- execute trades ---
+   if(buySignal && CountOpenPositions(ORDER_TYPE_BUY) < 2)
       OpenBuy(atrValue);
    if(sellSignal && CountOpenPositions(ORDER_TYPE_SELL) < 2)
       OpenSell(atrValue);
@@ -199,13 +197,13 @@ void OnTick()
 int DetermineTrendAggressive(double fast, double slow)
 {
    double diff = fast - slow;
-   double threshold = pointValue * 2;   // only 2 points threshold (very small)
+   double threshold = pointValue * 2;
    if(MathAbs(diff) < threshold) return 0;
    return (fast > slow) ? 1 : -1;
 }
 
 //+------------------------------------------------------------------+
-//| Open Buy (same as before, but with smaller SL/TP)               |
+//| Open Buy – fixed: IOC filling, extra buffer for min distance    |
 //+------------------------------------------------------------------+
 void OpenBuy(double atrValue)
 {
@@ -214,8 +212,9 @@ void OpenBuy(double atrValue)
    double entry = SymbolInfoDouble(expertSymbol, SYMBOL_ASK);
    double sl = entry - (atrValue * InpATRMultiplierSL);
    double tp = entry + (atrValue * InpATRMultiplierTP);
+   
    long stopsLevel = SymbolInfoInteger(expertSymbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double minDist = stopsLevel * pointValue;
+   double minDist = stopsLevel * pointValue + 2 * pointValue;  // +2 points buffer
    if(entry - sl < minDist) sl = entry - minDist;
    if(tp - entry < minDist) tp = entry + minDist;
    
@@ -231,7 +230,7 @@ void OpenBuy(double atrValue)
    req.deviation = InpSlippage;
    req.magic = expertMagic;
    req.comment = "Aggressive BUY";
-   req.type_filling = ORDER_FILLING_FOK;
+   req.type_filling = ORDER_FILLING_IOC;   // changed from FOK to IOC
    
    if(OrderSend(req, res))
    {
@@ -241,7 +240,7 @@ void OpenBuy(double atrValue)
 }
 
 //+------------------------------------------------------------------+
-//| Open Sell                                                       |
+//| Open Sell – fixed: IOC filling, extra buffer for min distance   |
 //+------------------------------------------------------------------+
 void OpenSell(double atrValue)
 {
@@ -250,8 +249,9 @@ void OpenSell(double atrValue)
    double entry = SymbolInfoDouble(expertSymbol, SYMBOL_BID);
    double sl = entry + (atrValue * InpATRMultiplierSL);
    double tp = entry - (atrValue * InpATRMultiplierTP);
+   
    long stopsLevel = SymbolInfoInteger(expertSymbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double minDist = stopsLevel * pointValue;
+   double minDist = stopsLevel * pointValue + 2 * pointValue;  // +2 points buffer
    if(sl - entry < minDist) sl = entry + minDist;
    if(entry - tp < minDist) tp = entry - minDist;
    
@@ -267,7 +267,7 @@ void OpenSell(double atrValue)
    req.deviation = InpSlippage;
    req.magic = expertMagic;
    req.comment = "Aggressive SELL";
-   req.type_filling = ORDER_FILLING_FOK;
+   req.type_filling = ORDER_FILLING_IOC;   // changed from FOK to IOC
    
    if(OrderSend(req, res))
    {
@@ -326,7 +326,7 @@ int CountOpenPositions(int type = -1)
 }
 
 //+------------------------------------------------------------------+
-//| Trailing stop (shortened)                                       |
+//| Trailing stop – unchanged, works fine                           |
 //+------------------------------------------------------------------+
 void ManageTrailingStops()
 {
@@ -395,7 +395,7 @@ bool IsTradingSession()
    if(start<=end) return (cur>=start && cur<end);
    else return (cur>=start || cur<end);
 }
-bool IsNewsTime() { return false; } // disabled for aggression
+bool IsNewsTime() { return false; }
 bool CheckDailyLossLimit()
 {
    double curBal = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -455,7 +455,7 @@ void ClosePosition(ulong ticket)
 EOF
 
 # ============================================================
-# ENTRYPOINT SCRIPT (with compilation)
+# ENTRYPOINT SCRIPT (unchanged)
 # ============================================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -485,7 +485,6 @@ fi
 mkdir -p "$DATA_DIR/Experts"
 cp /root/VALETAX_TICK_BOT_V16.mq5 "$DATA_DIR/Experts/"
 
-# Compile using metaeditor64.exe
 METAEDITOR="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
 if [ -f "$METAEDITOR" ]; then
     wine "$METAEDITOR" /compile:"$DATA_DIR/Experts/VALETAX_TICK_BOT_V16.mq5" /log:"/root/compile.log"
