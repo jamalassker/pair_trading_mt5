@@ -23,43 +23,35 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                     RSI_Divergence_Scalper_FINAL                 |
-//|                     Fixed: 10016 invalid stops                   |
-//|                     ForceTestTrade opens a guaranteed buy        |
+//|                                               TrendScalper.mq5   |
+//|                  Trend Following with ATR Trailing Stop          |
+//|                     Works on high-spread crypto brokers          |
 //+------------------------------------------------------------------+
-#property copyright "RSI Divergence Scalper FINAL"
-#property version   "4.00"
-#property strict
+#property copyright "TrendScalper"
+#property version   "2.00"
 #include <Trade/Trade.mqh>
 
 //==================== INPUTS ====================
-input double   RiskPercent          = 1.0;
+input double   RiskPercent          = 2.0;      // Risk per trade (% of equity)
 input double   FixedLot             = 0.01;
-input bool     UseAutoLot           = false;
+input bool     UseAutoLot           = true;
 
-input int      RSI_Period           = 7;
-input int      LookbackBars         = 10;
-input int      MinSwingDistance     = 1;
+input int      TrendFastEMA         = 20;       // Fast EMA (H1)
+input int      TrendSlowEMA         = 50;       // Slow EMA (H1)
+input int      EntryFastEMA         = 9;        // Fast EMA for pullback entry (M5)
+input int      ATRPeriod            = 14;       // ATR period
+input double   ATRStopMultiplier    = 2.5;      // ATR multiplier for stop loss
 
-input int      ATR_Period           = 7;
-input double   ATR_SL_Multiplier    = 5.0;      // Increased to force larger stop
-input double   ATR_TP_Multiplier    = 6.0;
-
-input int      MaxSpreadPoints      = 100000;
+input int      MaxSpreadPoints      = 100000;   // Very high spread allowed
 input int      MaxOpenPositions     = 1;
 
-input double   MaxDailyLossPercent  = 20.0;
-input double   MaxDrawdownPercent   = 40.0;
+input double   MaxDailyLossPercent  = 8.0;
+input double   MaxDrawdownPercent   = 15.0;
 
 input int      MagicNumber          = 99001;
-input int      Slippage             = 100;
+input int      Slippage             = 50;
 
 input bool     DebugMode            = true;
-input bool     EnableMomentumTrades = true;
-input bool     EnableRSIReversal    = true;
-
-// ============ FORCE TEST TRADE (use large stop) ============
-input bool     ForceTestTrade       = true;   // <- SET TO TRUE TO OPEN A BUY
 
 //==================== GLOBALS ====================
 string         symbol;
@@ -67,11 +59,13 @@ double         pointValue, tickValue, tickSize;
 double         dailyStartBalance;
 bool           tradingPaused = false;
 bool           drawdownHit   = false;
-bool           forceTradeDone = false;
-datetime       lastBarTime = 0;
+datetime       lastDebugTime = 0;
+datetime       lastBarTimeH1 = 0;
+datetime       lastBarTimeM5 = 0;
 
+int            h1_fast_handle, h1_slow_handle;
+int            m5_fast_handle;
 int            atr_handle;
-int            rsi_handle;
 CTrade         trade;
 
 //+------------------------------------------------------------------+
@@ -87,93 +81,114 @@ int OnInit()
    trade.SetDeviationInPoints(Slippage);
    trade.SetTypeFillingBySymbol(symbol);
 
-   atr_handle = iATR(symbol, PERIOD_M5, ATR_Period);
-   rsi_handle = iRSI(symbol, PERIOD_M5, RSI_Period, PRICE_CLOSE);
-   if(atr_handle == INVALID_HANDLE || rsi_handle == INVALID_HANDLE)
-      return INIT_FAILED;
+   h1_fast_handle = iMA(symbol, PERIOD_H1, TrendFastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   h1_slow_handle = iMA(symbol, PERIOD_H1, TrendSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   m5_fast_handle = iMA(symbol, PERIOD_M5, EntryFastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   atr_handle     = iATR(symbol, PERIOD_M5, ATRPeriod);
 
-   Print("==========================================");
-   Print("🚀 RSI DIVERGENCE SCALPER FINAL");
-   Print("   Symbol: ", symbol, " | Timeframe: M5");
-   Print("   ForceTestTrade = ", ForceTestTrade ? "ON (will open test BUY)" : "OFF");
-   Print("==========================================");
+   if(h1_fast_handle == INVALID_HANDLE || h1_slow_handle == INVALID_HANDLE ||
+      m5_fast_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE)
+   {
+      Print("Indicator creation failed");
+      return INIT_FAILED;
+   }
+
+   Print("==============================================");
+   Print("✅ TrendScalper started on ", symbol);
+   Print("   H1 Trend EMA: ", TrendFastEMA, "/", TrendSlowEMA);
+   Print("   ATR stop multiplier: ", ATRStopMultiplier);
+   Print("==============================================");
    return INIT_SUCCEEDED;
 }
+
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   if(h1_fast_handle != INVALID_HANDLE) IndicatorRelease(h1_fast_handle);
+   if(h1_slow_handle != INVALID_HANDLE) IndicatorRelease(h1_slow_handle);
+   if(m5_fast_handle != INVALID_HANDLE) IndicatorRelease(m5_fast_handle);
    if(atr_handle != INVALID_HANDLE) IndicatorRelease(atr_handle);
-   if(rsi_handle != INVALID_HANDLE) IndicatorRelease(rsi_handle);
+   Print("EA removed");
 }
+
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Safety checks
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
-   {
-      Comment("❌ AutoTrading disabled");
-      return;
-   }
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
    if(drawdownHit || tradingPaused) return;
-   if(CheckDailyLoss() || CheckDrawdown()) return;
+   if(CheckDailyLoss()) return;
+   if(CheckDrawdown()) return;
    if(GetSpreadPoints() > MaxSpreadPoints) return;
    if(CountPositions() >= MaxOpenPositions) return;
 
-   // ========== FORCE TEST TRADE (with very large stop) ==========
-   if(ForceTestTrade && !forceTradeDone)
+   // ---------- H1 trend update (once per hour) ----------
+   datetime curBarH1 = iTime(symbol, PERIOD_H1, 0);
+   if(curBarH1 != lastBarTimeH1)
    {
-      forceTradeDone = true;
-      Print("!!! FORCE TEST TRADE: placing one BUY order with large stop !!!");
-      // Use a fixed huge stop distance: 15000 points = 150.0 price units
-      double hugeStopPoints = 15000;   // 150.0 price difference
-      double atrForTest = hugeStopPoints * pointValue;
-      OpenOrder(ORDER_TYPE_BUY, atrForTest);
-      return;   // skip signal logic on this tick
+      lastBarTimeH1 = curBarH1;
+      double h1_fast[], h1_slow[];
+      ArraySetAsSeries(h1_fast, true); ArraySetAsSeries(h1_slow, true);
+      if(CopyBuffer(h1_fast_handle, 0, 0, 2, h1_fast) >= 2 &&
+         CopyBuffer(h1_slow_handle, 0, 0, 2, h1_slow) >= 2)
+      {
+         bool uptrend_h1 = (h1_fast[0] > h1_slow[0]);
+         bool downtrend_h1 = (h1_fast[0] < h1_slow[0]);
+         GlobalVariableSet("Trend_H1", uptrend_h1 ? 1 : (downtrend_h1 ? -1 : 0));
+         if(DebugMode) Print("H1 Trend updated: ", uptrend_h1 ? "UP" : (downtrend_h1 ? "DOWN" : "FLAT"));
+      }
    }
 
-   // Only on new M5 bar
-   datetime curBar = iTime(symbol, PERIOD_M5, 0);
-   if(curBar == lastBarTime) return;
-   lastBarTime = curBar;
+   // ---------- M5 entry check (on each new M5 bar) ----------
+   datetime curBarM5 = iTime(symbol, PERIOD_M5, 0);
+   if(curBarM5 == lastBarTimeM5) return;
+   lastBarTimeM5 = curBarM5;
 
-   // Get data
-   double atrBuf[], rsiBuf[], closeBuf[];
-   ArraySetAsSeries(atrBuf, true); ArraySetAsSeries(rsiBuf, true); ArraySetAsSeries(closeBuf, true);
-   if(CopyBuffer(atr_handle, 0, 0, 3, atrBuf) < 3 ||
-      CopyBuffer(rsi_handle, 0, 0, LookbackBars, rsiBuf) < LookbackBars ||
-      CopyClose(symbol, PERIOD_M5, 0, LookbackBars, closeBuf) < LookbackBars)
-      return;
+   double trendH1 = GlobalVariableGet("Trend_H1");
+   if(trendH1 == 0) return;
 
-   double atr = atrBuf[0];
-   if(atr <= 0) atr = 500 * pointValue;
+   // Get M5 fast EMA
+   double m5_fast[];
+   ArraySetAsSeries(m5_fast, true);
+   if(CopyBuffer(m5_fast_handle, 0, 0, 2, m5_fast) < 2) return;
 
-   // Signals (same as before)
-   bool bullishSignal = false, bearishSignal = false;
-   for(int i=2; i<LookbackBars-1; i++)
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double price = (trendH1 == 1) ? ask : bid;
+   double fastEMA = m5_fast[0];
+
+   // Entry condition: pullback to EMA in trend direction
+   bool buySignal = (trendH1 == 1 && bid <= fastEMA);
+   bool sellSignal = (trendH1 == -1 && ask >= fastEMA);
+
+   // Debug print every 10 seconds
+   if(DebugMode && TimeCurrent() - lastDebugTime >= 10)
    {
-      if(closeBuf[0] < closeBuf[i] && rsiBuf[0] >= rsiBuf[i]-5) { bullishSignal = true; break; }
-      if(closeBuf[0] > closeBuf[i] && rsiBuf[0] <= rsiBuf[i]+5) { bearishSignal = true; break; }
-   }
-   if(EnableRSIReversal)
-   {
-      if(rsiBuf[0] < 40) bullishSignal = true;
-      if(rsiBuf[0] > 60) bearishSignal = true;
-   }
-   if(EnableMomentumTrades && LookbackBars >= 3)
-   {
-      if(closeBuf[0] > closeBuf[1] && closeBuf[1] > closeBuf[2]) bullishSignal = true;
-      if(closeBuf[0] < closeBuf[1] && closeBuf[1] < closeBuf[2]) bearishSignal = true;
+      lastDebugTime = TimeCurrent();
+      Print("DEBUG | H1 trend: ", (trendH1==1?"UP":(trendH1==-1?"DOWN":"FLAT")),
+            " | M5 FastEMA=", DoubleToString(fastEMA,2),
+            " | Ask=", ask, " | Bid=", bid,
+            " | Spread=", GetSpreadPoints());
    }
 
-   if(bullishSignal && CountPositions() < MaxOpenPositions)
-      OpenOrder(ORDER_TYPE_BUY, atr);
-   else if(bearishSignal && CountPositions() < MaxOpenPositions)
-      OpenOrder(ORDER_TYPE_SELL, atr);
+   if(buySignal)
+   {
+      Print("🔥 BUY SIGNAL | Price=", ask, " | FastEMA=", fastEMA);
+      OpenOrder(ORDER_TYPE_BUY);
+   }
+   else if(sellSignal)
+   {
+      Print("🔥 SELL SIGNAL | Price=", bid, " | FastEMA=", fastEMA);
+      OpenOrder(ORDER_TYPE_SELL);
+   }
+
+   // Manage trailing stops for open positions
+   ManageTrailingStops();
 }
+
 //+------------------------------------------------------------------+
-void OpenOrder(ENUM_ORDER_TYPE type, double atrVal)
+void OpenOrder(ENUM_ORDER_TYPE type)
 {
-   double lot = CalculateLot(atrVal);
+   double lot = CalculateLot();
    if(lot <= 0) return;
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
@@ -181,47 +196,62 @@ void OpenOrder(ENUM_ORDER_TYPE type, double atrVal)
                                            : SymbolInfoDouble(symbol, SYMBOL_BID);
    price = NormalizeDouble(price, digits);
 
-   // === FORCE MINIMUM STOP DISTANCE (in points) ===
-   // Broker minimum from settings
-   long brokerMinPoints = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   if(brokerMinPoints < 2000) brokerMinPoints = 2000;   // Safety: at least 2000 points
-   double minStopPrice = brokerMinPoints * pointValue;
+   // Get current ATR value (M5)
+   double atrVal = 0;
+   double atrBuf[];
+   ArraySetAsSeries(atrBuf, true);
+   if(CopyBuffer(atr_handle, 0, 0, 1, atrBuf) == 1)
+      atrVal = atrBuf[0];
+   else
+      atrVal = 50 * pointValue;   // fallback 50 points
 
-   // Desired stop distance (ATR-based or fixed)
-   double slDist = atrVal * ATR_SL_Multiplier;
-   if(slDist < minStopPrice) slDist = minStopPrice + (500 * pointValue); // extra 500 points buffer
-   double tpDist = slDist * (ATR_TP_Multiplier / ATR_SL_Multiplier);
+   double stopDist = atrVal * ATRStopMultiplier;
+   double tpDist = stopDist * 1.2;   // 1.2:1 risk-reward
+
+   // Enforce broker minimum stop distance (convert to price distance)
+   long stopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopPrice = stopsLevel * pointValue;
+   if(stopDist < minStopPrice) stopDist = minStopPrice;
    if(tpDist < minStopPrice) tpDist = minStopPrice;
 
-   double sl = (type == ORDER_TYPE_BUY) ? price - slDist : price + slDist;
+   double sl = (type == ORDER_TYPE_BUY) ? price - stopDist : price + stopDist;
    double tp = (type == ORDER_TYPE_BUY) ? price + tpDist : price - tpDist;
    sl = NormalizeDouble(sl, digits);
    tp = NormalizeDouble(tp, digits);
 
-   Print("📊 ORDER PREP | Lot=", lot, " | Price=", price,
-         " | SL dist=", (price-sl)/pointValue, " pts (broker min=", brokerMinPoints, ")",
-         " | TP dist=", (tp-price)/pointValue, " pts");
+   Print("📊 ORDER | Lot=", lot, " Price=", price, " SL=", sl, " TP=", tp,
+         " | StopDist=", stopDist/pointValue, " pts");
 
    bool result = false;
    if(type == ORDER_TYPE_BUY)
-      result = trade.Buy(lot, symbol, price, sl, tp, "[RSI_DIV] BUY");
+      result = trade.Buy(lot, symbol, price, sl, tp, "TrendScalper BUY");
    else
-      result = trade.Sell(lot, symbol, price, sl, tp, "[RSI_DIV] SELL");
+      result = trade.Sell(lot, symbol, price, sl, tp, "TrendScalper SELL");
 
    if(result)
       Print("✅ ORDER SUCCESS");
    else
-      Print("❌ ORDER FAILED | retcode=", trade.ResultRetcode(),
-            " | ", trade.ResultRetcodeDescription());
+      Print("❌ ORDER FAILED | retcode=", trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
 }
+
 //+------------------------------------------------------------------+
-double CalculateLot(double atrVal)
+double CalculateLot()
 {
    if(!UseAutoLot) return FixedLot;
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskMoney = equity * RiskPercent / 100.0;
-   double stopPoints = (atrVal * ATR_SL_Multiplier) / pointValue;
-   if(stopPoints <= 0) stopPoints = 2000;
+   double atrVal = 0;
+   double atrBuf[];
+   ArraySetAsSeries(atrBuf, true);
+   if(CopyBuffer(atr_handle, 0, 0, 1, atrBuf) == 1)
+      atrVal = atrBuf[0];
+   else
+      atrVal = 50 * pointValue;
+   double stopDist = atrVal * ATRStopMultiplier;
+   long stopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopPrice = stopsLevel * pointValue;
+   if(stopDist < minStopPrice) stopDist = minStopPrice;
+   double stopPoints = stopDist / pointValue;
    double riskPerLot = stopPoints * tickValue;
    if(riskPerLot <= 0) return FixedLot;
    double lot = riskMoney / riskPerLot;
@@ -233,11 +263,41 @@ double CalculateLot(double atrVal)
    if(lot < minLot) lot = minLot;
    return NormalizeDouble(lot, 2);
 }
+
+//+------------------------------------------------------------------+
+void ManageTrailingStops()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double price = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID)
+                                                 : SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+      double atrBuf[];
+      ArraySetAsSeries(atrBuf, true);
+      if(CopyBuffer(atr_handle, 0, 0, 1, atrBuf) < 1) continue;
+      double trailDist = atrBuf[0] * ATRStopMultiplier;
+
+      double newSL = (type == POSITION_TYPE_BUY) ? price - trailDist : price + trailDist;
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      newSL = NormalizeDouble(newSL, digits);
+      if((type == POSITION_TYPE_BUY && newSL > currentSL) ||
+         (type == POSITION_TYPE_SELL && (newSL < currentSL || currentSL == 0)))
+         trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+   }
+}
+
 //+------------------------------------------------------------------+
 int CountPositions()
 {
    int cnt = 0;
-   for(int i=0; i<PositionsTotal(); i++)
+   for(int i = 0; i < PositionsTotal(); i++)
    {
       ulong t = PositionGetTicket(i);
       if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
@@ -245,20 +305,36 @@ int CountPositions()
    }
    return cnt;
 }
+
 int GetSpreadPoints()
 {
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
    return (int)((ask - bid) / pointValue);
 }
+
 bool CheckDailyLoss()
 {
    double curBal = AccountInfoDouble(ACCOUNT_BALANCE);
    double lossPct = (dailyStartBalance - curBal) / dailyStartBalance * 100.0;
    if(lossPct >= MaxDailyLossPercent && !tradingPaused)
-   { tradingPaused = true; Print("Daily loss limit reached"); return true; }
+   {
+      Print("Daily loss limit (", MaxDailyLossPercent, "%) reached.");
+      tradingPaused = true;
+      return true;
+   }
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   static int lastDay = dt.day;
+   if(dt.day != lastDay)
+   {
+      dailyStartBalance = curBal;
+      lastDay = dt.day;
+      tradingPaused = false;
+   }
    return false;
 }
+
 bool CheckDrawdown()
 {
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -266,10 +342,19 @@ bool CheckDrawdown()
    if(bal <= 0) return false;
    double ddPct = (bal - eq) / bal * 100.0;
    if(ddPct >= MaxDrawdownPercent && !drawdownHit)
-   { drawdownHit = true; Print("Max drawdown reached"); return true; }
+   {
+      Print("Max drawdown (", MaxDrawdownPercent, "%) reached. Closing all.");
+      drawdownHit = true;
+      for(int i = PositionsTotal()-1; i >= 0; i--)
+      {
+         ulong t = PositionGetTicket(i);
+         if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            trade.PositionClose(t);
+      }
+      return true;
+   }
    return false;
 }
-void ManageTrailing() {} // optional, not needed for test
 //+------------------------------------------------------------------+
 EOF
 
