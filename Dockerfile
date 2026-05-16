@@ -23,496 +23,253 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                     AggressiveMicroScalper_Final |
-//|                              Opens trades reliably               |
+//|                     RSI_Divergence_Scalper_FINAL                 |
+//|                     Fixed: 10016 invalid stops                   |
+//|                     ForceTestTrade opens a guaranteed buy        |
 //+------------------------------------------------------------------+
-#property copyright "Aggressive Scalper EA"
-#property version   "3.01"
+#property copyright "RSI Divergence Scalper FINAL"
+#property version   "4.00"
 #property strict
+#include <Trade/Trade.mqh>
 
-// --- Inputs (aggressive, adjustable) ---
-input double   InpRiskPercent        = 2.0;
-input double   InpFixedLot           = 0.01;
-input bool     InpUseAutoLot         = true;
-input double   InpMaxDailyLoss       = 20.0;
-input double   InpMaxDrawdown        = 25.0;
+//==================== INPUTS ====================
+input double   RiskPercent          = 1.0;
+input double   FixedLot             = 0.01;
+input bool     UseAutoLot           = false;
 
-input int      InpFastEMA            = 10;
-input int      InpSlowEMA            = 30;
-input int      InpRSIPeriod          = 7;
-input int      InpRSIOverbought      = 65;
-input int      InpRSIOversold        = 35;
-input int      InpATRPeriod          = 10;
+input int      RSI_Period           = 7;
+input int      LookbackBars         = 10;
+input int      MinSwingDistance     = 1;
 
-input double   InpATRMultiplierSL    = 1.0;
-input double   InpATRMultiplierTP    = 1.5;
-input bool     InpUseTrailing        = true;
-input int      InpTrailingStart      = 10;
-input int      InpTrailingStep       = 5;
+input int      ATR_Period           = 7;
+input double   ATR_SL_Multiplier    = 5.0;      // Increased to force larger stop
+input double   ATR_TP_Multiplier    = 6.0;
 
-input bool     InpUseSessionFilter   = false;
-input int      InpSessionStartHour   = 0;
-input int      InpSessionEndHour     = 24;
-input bool     InpAvoidNews          = false;
+input int      MaxSpreadPoints      = 100000;
+input int      MaxOpenPositions     = 1;
 
-input int      InpMagicNumber        = 20251001;
-input int      InpSlippage           = 50;
-input bool     InpPrintLog           = true;
+input double   MaxDailyLossPercent  = 20.0;
+input double   MaxDrawdownPercent   = 40.0;
 
-input bool     InpAllowMultiplePerBar = true;
-input bool     InpIgnoreTrendThreshold = true;
+input int      MagicNumber          = 99001;
+input int      Slippage             = 100;
 
-// --- Global ---
-int            emaFastHandle, emaSlowHandle, rsiHandle, atrHandle;
-double         emaFast[], emaSlow[], rsi[], atr[];
-int            expertMagic;
-string         expertSymbol;
-double         pointValue, tickSize;
-datetime       lastBarTime;
-double         dailyStartingBalance;
-bool           isTradingPaused = false;
-bool           drawdownLimitHit = false;
+input bool     DebugMode            = true;
+input bool     EnableMomentumTrades = true;
+input bool     EnableRSIReversal    = true;
+
+// ============ FORCE TEST TRADE (use large stop) ============
+input bool     ForceTestTrade       = true;   // <- SET TO TRUE TO OPEN A BUY
+
+//==================== GLOBALS ====================
+string         symbol;
+double         pointValue, tickValue, tickSize;
+double         dailyStartBalance;
+bool           tradingPaused = false;
+bool           drawdownHit   = false;
+bool           forceTradeDone = false;
+datetime       lastBarTime = 0;
+
+int            atr_handle;
+int            rsi_handle;
+CTrade         trade;
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   expertSymbol = Symbol();
-   expertMagic = InpMagicNumber;
+   symbol = _Symbol;
+   pointValue = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   tickValue  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   tickSize   = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
 
-   pointValue = SymbolInfoDouble(expertSymbol, SYMBOL_POINT);
-   tickSize   = SymbolInfoDouble(expertSymbol, SYMBOL_TRADE_TICK_SIZE);
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetTypeFillingBySymbol(symbol);
 
-   lastBarTime = iTime(expertSymbol, PERIOD_M1, 0);
-
-   dailyStartingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-
-   emaFastHandle = iMA(expertSymbol, PERIOD_M1, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
-   emaSlowHandle = iMA(expertSymbol, PERIOD_M1, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
-   rsiHandle     = iRSI(expertSymbol, PERIOD_M1, InpRSIPeriod, PRICE_CLOSE);
-   atrHandle     = iATR(expertSymbol, PERIOD_M1, InpATRPeriod);
-
-   if(emaFastHandle==INVALID_HANDLE ||
-      emaSlowHandle==INVALID_HANDLE ||
-      rsiHandle==INVALID_HANDLE ||
-      atrHandle==INVALID_HANDLE)
+   atr_handle = iATR(symbol, PERIOD_M5, ATR_Period);
+   rsi_handle = iRSI(symbol, PERIOD_M5, RSI_Period, PRICE_CLOSE);
+   if(atr_handle == INVALID_HANDLE || rsi_handle == INVALID_HANDLE)
       return INIT_FAILED;
 
-   ArraySetAsSeries(emaFast, true);
-   ArraySetAsSeries(emaSlow, true);
-   ArraySetAsSeries(rsi, true);
-   ArraySetAsSeries(atr, true);
-
-   Print("EA started on ", expertSymbol);
-   Print("Broker filling mode = ",
-         SymbolInfoInteger(expertSymbol, SYMBOL_FILLING_MODE));
-
+   Print("==========================================");
+   Print("🚀 RSI DIVERGENCE SCALPER FINAL");
+   Print("   Symbol: ", symbol, " | Timeframe: M5");
+   Print("   ForceTestTrade = ", ForceTestTrade ? "ON (will open test BUY)" : "OFF");
+   Print("==========================================");
    return INIT_SUCCEEDED;
 }
-
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(emaFastHandle!=INVALID_HANDLE) IndicatorRelease(emaFastHandle);
-   if(emaSlowHandle!=INVALID_HANDLE) IndicatorRelease(emaSlowHandle);
-   if(rsiHandle!=INVALID_HANDLE) IndicatorRelease(rsiHandle);
-   if(atrHandle!=INVALID_HANDLE) IndicatorRelease(atrHandle);
-
-   Print("EA removed");
+   if(atr_handle != INVALID_HANDLE) IndicatorRelease(atr_handle);
+   if(rsi_handle != INVALID_HANDLE) IndicatorRelease(rsi_handle);
 }
-
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
-   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
-   if(!SymbolInfoInteger(expertSymbol, SYMBOL_TRADE_MODE)) return;
-
-   if(drawdownLimitHit) return;
-   if(CheckDailyLossLimit()) return;
-   if(CheckDrawdownLimit()) return;
-
-   if(InpAvoidNews && IsNewsTime()) return;
-   if(InpUseSessionFilter && !IsTradingSession()) return;
-
-   datetime currentBarTime = iTime(expertSymbol, PERIOD_M1, 0);
-
-   if(!InpAllowMultiplePerBar &&
-      currentBarTime == lastBarTime)
-      return;
-
-   if(currentBarTime != lastBarTime)
-      lastBarTime = currentBarTime;
-
-   if(!UpdateIndicatorData()) return;
-
-   double fastEMA = emaFast[0];
-   double slowEMA = emaSlow[0];
-   double rsiValue = rsi[0];
-   double atrValue = atr[0];
-
-   int trend = DetermineTrend(fastEMA, slowEMA);
-
-   bool buySignal = false;
-   bool sellSignal = false;
-
-   if(trend == 1 ||
-      (InpIgnoreTrendThreshold && fastEMA > slowEMA))
+   // Safety checks
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
    {
-      double price = SymbolInfoDouble(expertSymbol, SYMBOL_BID);
-
-      double emaDist =
-         MathAbs(price - fastEMA) / pointValue;
-
-      double maxDist =
-         InpIgnoreTrendThreshold ?
-         100 :
-         (atrValue / pointValue);
-
-      if(emaDist <= maxDist &&
-         rsiValue < InpRSIOverbought)
-         buySignal = true;
-   }
-
-   if(trend == -1 ||
-      (InpIgnoreTrendThreshold && fastEMA < slowEMA))
-   {
-      double price = SymbolInfoDouble(expertSymbol, SYMBOL_ASK);
-
-      double emaDist =
-         MathAbs(price - fastEMA) / pointValue;
-
-      double maxDist =
-         InpIgnoreTrendThreshold ?
-         100 :
-         (atrValue / pointValue);
-
-      if(emaDist <= maxDist &&
-         rsiValue > InpRSIOversold)
-         sellSignal = true;
-   }
-
-   if(buySignal &&
-      CountOpenPositions(ORDER_TYPE_BUY) < 2)
-      OpenBuy(atrValue);
-
-   if(sellSignal &&
-      CountOpenPositions(ORDER_TYPE_SELL) < 2)
-      OpenSell(atrValue);
-
-   if(InpUseTrailing)
-      ManageTrailingStops();
-}
-
-//+------------------------------------------------------------------+
-int DetermineTrend(double fast, double slow)
-{
-   double diff = fast - slow;
-   double threshold = pointValue * 5;
-
-   if(MathAbs(diff) < threshold)
-      return 0;
-
-   return (fast > slow) ? 1 : -1;
-}
-
-//+------------------------------------------------------------------+
-void OpenBuy(double atrValue)
-{
-   double lotSize =
-      CalculateLotSize(atrValue, ORDER_TYPE_BUY);
-
-   double minLot =
-      SymbolInfoDouble(expertSymbol, SYMBOL_VOLUME_MIN);
-
-   if(lotSize < minLot || lotSize <= 0)
-   {
-      Print("BUY lot invalid: ", lotSize);
+      Comment("❌ AutoTrading disabled");
       return;
    }
+   if(drawdownHit || tradingPaused) return;
+   if(CheckDailyLoss() || CheckDrawdown()) return;
+   if(GetSpreadPoints() > MaxSpreadPoints) return;
+   if(CountPositions() >= MaxOpenPositions) return;
 
-   double entry =
-      SymbolInfoDouble(expertSymbol, SYMBOL_ASK);
+   // ========== FORCE TEST TRADE (with very large stop) ==========
+   if(ForceTestTrade && !forceTradeDone)
+   {
+      forceTradeDone = true;
+      Print("!!! FORCE TEST TRADE: placing one BUY order with large stop !!!");
+      // Use a fixed huge stop distance: 15000 points = 150.0 price units
+      double hugeStopPoints = 15000;   // 150.0 price difference
+      double atrForTest = hugeStopPoints * pointValue;
+      OpenOrder(ORDER_TYPE_BUY, atrForTest);
+      return;   // skip signal logic on this tick
+   }
 
-   double sl =
-      entry - (atrValue * InpATRMultiplierSL);
+   // Only on new M5 bar
+   datetime curBar = iTime(symbol, PERIOD_M5, 0);
+   if(curBar == lastBarTime) return;
+   lastBarTime = curBar;
 
-   double tp =
-      entry + (atrValue * InpATRMultiplierTP);
+   // Get data
+   double atrBuf[], rsiBuf[], closeBuf[];
+   ArraySetAsSeries(atrBuf, true); ArraySetAsSeries(rsiBuf, true); ArraySetAsSeries(closeBuf, true);
+   if(CopyBuffer(atr_handle, 0, 0, 3, atrBuf) < 3 ||
+      CopyBuffer(rsi_handle, 0, 0, LookbackBars, rsiBuf) < LookbackBars ||
+      CopyClose(symbol, PERIOD_M5, 0, LookbackBars, closeBuf) < LookbackBars)
+      return;
 
-   long stopsLevel =
-      SymbolInfoInteger(expertSymbol,
-                        SYMBOL_TRADE_STOPS_LEVEL);
+   double atr = atrBuf[0];
+   if(atr <= 0) atr = 500 * pointValue;
 
-   long freezeLevel =
-      SymbolInfoInteger(expertSymbol,
-                        SYMBOL_TRADE_FREEZE_LEVEL);
+   // Signals (same as before)
+   bool bullishSignal = false, bearishSignal = false;
+   for(int i=2; i<LookbackBars-1; i++)
+   {
+      if(closeBuf[0] < closeBuf[i] && rsiBuf[0] >= rsiBuf[i]-5) { bullishSignal = true; break; }
+      if(closeBuf[0] > closeBuf[i] && rsiBuf[0] <= rsiBuf[i]+5) { bearishSignal = true; break; }
+   }
+   if(EnableRSIReversal)
+   {
+      if(rsiBuf[0] < 40) bullishSignal = true;
+      if(rsiBuf[0] > 60) bearishSignal = true;
+   }
+   if(EnableMomentumTrades && LookbackBars >= 3)
+   {
+      if(closeBuf[0] > closeBuf[1] && closeBuf[1] > closeBuf[2]) bullishSignal = true;
+      if(closeBuf[0] < closeBuf[1] && closeBuf[1] < closeBuf[2]) bearishSignal = true;
+   }
 
-   double minDist =
-      MathMax(stopsLevel, freezeLevel)
-      * pointValue
-      + 3 * pointValue;
+   if(bullishSignal && CountPositions() < MaxOpenPositions)
+      OpenOrder(ORDER_TYPE_BUY, atr);
+   else if(bearishSignal && CountPositions() < MaxOpenPositions)
+      OpenOrder(ORDER_TYPE_SELL, atr);
+}
+//+------------------------------------------------------------------+
+void OpenOrder(ENUM_ORDER_TYPE type, double atrVal)
+{
+   double lot = CalculateLot(atrVal);
+   if(lot <= 0) return;
 
-   if(entry - sl < minDist)
-      sl = entry - minDist;
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+                                           : SymbolInfoDouble(symbol, SYMBOL_BID);
+   price = NormalizeDouble(price, digits);
 
-   if(tp - entry < minDist)
-      tp = entry + minDist;
+   // === FORCE MINIMUM STOP DISTANCE (in points) ===
+   // Broker minimum from settings
+   long brokerMinPoints = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   if(brokerMinPoints < 2000) brokerMinPoints = 2000;   // Safety: at least 2000 points
+   double minStopPrice = brokerMinPoints * pointValue;
 
-   // ===== FIXED FILLING MODE =====
-   ENUM_ORDER_TYPE_FILLING fillMode;
+   // Desired stop distance (ATR-based or fixed)
+   double slDist = atrVal * ATR_SL_Multiplier;
+   if(slDist < minStopPrice) slDist = minStopPrice + (500 * pointValue); // extra 500 points buffer
+   double tpDist = slDist * (ATR_TP_Multiplier / ATR_SL_Multiplier);
+   if(tpDist < minStopPrice) tpDist = minStopPrice;
 
-   long brokerFillMode =
-      SymbolInfoInteger(expertSymbol,
-                        SYMBOL_FILLING_MODE);
+   double sl = (type == ORDER_TYPE_BUY) ? price - slDist : price + slDist;
+   double tp = (type == ORDER_TYPE_BUY) ? price + tpDist : price - tpDist;
+   sl = NormalizeDouble(sl, digits);
+   tp = NormalizeDouble(tp, digits);
 
-   if(brokerFillMode == SYMBOL_FILLING_FOK)
-      fillMode = ORDER_FILLING_FOK;
-   else if(brokerFillMode == SYMBOL_FILLING_IOC)
-      fillMode = ORDER_FILLING_IOC;
+   Print("📊 ORDER PREP | Lot=", lot, " | Price=", price,
+         " | SL dist=", (price-sl)/pointValue, " pts (broker min=", brokerMinPoints, ")",
+         " | TP dist=", (tp-price)/pointValue, " pts");
+
+   bool result = false;
+   if(type == ORDER_TYPE_BUY)
+      result = trade.Buy(lot, symbol, price, sl, tp, "[RSI_DIV] BUY");
    else
-      fillMode = ORDER_FILLING_RETURN;
+      result = trade.Sell(lot, symbol, price, sl, tp, "[RSI_DIV] SELL");
 
-   MqlTradeRequest req = {};
-   MqlTradeResult  res = {};
-
-   req.action       = TRADE_ACTION_DEAL;
-   req.symbol       = expertSymbol;
-   req.volume       = lotSize;
-   req.type         = ORDER_TYPE_BUY;
-   req.price        = entry;
-
-   // TEMPORARY FIX FOR SOME BROKERS
-   // REMOVE THESE IF NEEDED
-   req.sl           = 0;
-   req.tp           = 0;
-
-   req.deviation    = InpSlippage;
-   req.magic        = expertMagic;
-   req.comment      = "Aggressive BUY";
-   req.type_filling = fillMode;
-
-   bool sent = OrderSend(req, res);
-
-   Print("BUY | sent=", sent,
-         " retcode=", res.retcode,
-         " comment=", res.comment,
-         " error=", GetLastError());
-
-   if(sent &&
-      (res.retcode == TRADE_RETCODE_DONE ||
-       res.retcode == TRADE_RETCODE_PLACED))
-   {
-      Print("BUY OPENED");
-
-      // Apply SL/TP after execution
-      if(PositionSelect(expertSymbol))
-      {
-         ulong ticket =
-            PositionGetInteger(POSITION_TICKET);
-
-         ModifyPositionSLTP(ticket, sl, tp);
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-void OpenSell(double atrValue)
-{
-   double lotSize =
-      CalculateLotSize(atrValue, ORDER_TYPE_SELL);
-
-   double minLot =
-      SymbolInfoDouble(expertSymbol, SYMBOL_VOLUME_MIN);
-
-   if(lotSize < minLot || lotSize <= 0)
-   {
-      Print("SELL lot invalid: ", lotSize);
-      return;
-   }
-
-   double entry =
-      SymbolInfoDouble(expertSymbol, SYMBOL_BID);
-
-   double sl =
-      entry + (atrValue * InpATRMultiplierSL);
-
-   double tp =
-      entry - (atrValue * InpATRMultiplierTP);
-
-   long stopsLevel =
-      SymbolInfoInteger(expertSymbol,
-                        SYMBOL_TRADE_STOPS_LEVEL);
-
-   long freezeLevel =
-      SymbolInfoInteger(expertSymbol,
-                        SYMBOL_TRADE_FREEZE_LEVEL);
-
-   double minDist =
-      MathMax(stopsLevel, freezeLevel)
-      * pointValue
-      + 3 * pointValue;
-
-   if(sl - entry < minDist)
-      sl = entry + minDist;
-
-   if(entry - tp < minDist)
-      tp = entry - minDist;
-
-   // ===== FIXED FILLING MODE =====
-   ENUM_ORDER_TYPE_FILLING fillMode;
-
-   long brokerFillMode =
-      SymbolInfoInteger(expertSymbol,
-                        SYMBOL_FILLING_MODE);
-
-   if(brokerFillMode == SYMBOL_FILLING_FOK)
-      fillMode = ORDER_FILLING_FOK;
-   else if(brokerFillMode == SYMBOL_FILLING_IOC)
-      fillMode = ORDER_FILLING_IOC;
+   if(result)
+      Print("✅ ORDER SUCCESS");
    else
-      fillMode = ORDER_FILLING_RETURN;
-
-   MqlTradeRequest req = {};
-   MqlTradeResult  res = {};
-
-   req.action       = TRADE_ACTION_DEAL;
-   req.symbol       = expertSymbol;
-   req.volume       = lotSize;
-   req.type         = ORDER_TYPE_SELL;
-   req.price        = entry;
-
-   // TEMPORARY FIX FOR SOME BROKERS
-   req.sl           = 0;
-   req.tp           = 0;
-
-   req.deviation    = InpSlippage;
-   req.magic        = expertMagic;
-   req.comment      = "Aggressive SELL";
-   req.type_filling = fillMode;
-
-   bool sent = OrderSend(req, res);
-
-   Print("SELL | sent=", sent,
-         " retcode=", res.retcode,
-         " comment=", res.comment,
-         " error=", GetLastError());
-
-   if(sent &&
-      (res.retcode == TRADE_RETCODE_DONE ||
-       res.retcode == TRADE_RETCODE_PLACED))
-   {
-      Print("SELL OPENED");
-
-      if(PositionSelect(expertSymbol))
-      {
-         ulong ticket =
-            PositionGetInteger(POSITION_TICKET);
-
-         ModifyPositionSLTP(ticket, sl, tp);
-      }
-   }
+      Print("❌ ORDER FAILED | retcode=", trade.ResultRetcode(),
+            " | ", trade.ResultRetcodeDescription());
 }
-
 //+------------------------------------------------------------------+
-void ModifyPositionSLTP(ulong ticket,
-                        double sl,
-                        double tp)
+double CalculateLot(double atrVal)
 {
-   MqlTradeRequest req = {};
-   MqlTradeResult  res = {};
-
-   req.action   = TRADE_ACTION_SLTP;
-   req.position = ticket;
-   req.symbol   = expertSymbol;
-   req.sl       = sl;
-   req.tp       = tp;
-
-   OrderSend(req, res);
-
-   Print("SLTP MODIFY | retcode=",
-         res.retcode,
-         " comment=",
-         res.comment);
+   if(!UseAutoLot) return FixedLot;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * RiskPercent / 100.0;
+   double stopPoints = (atrVal * ATR_SL_Multiplier) / pointValue;
+   if(stopPoints <= 0) stopPoints = 2000;
+   double riskPerLot = stopPoints * tickValue;
+   if(riskPerLot <= 0) return FixedLot;
+   double lot = riskMoney / riskPerLot;
+   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathFloor(lot / step) * step;
+   if(lot < minLot) lot = minLot;
+   return NormalizeDouble(lot, 2);
 }
-
 //+------------------------------------------------------------------+
-//+------------------------------------------------------------------+
-//| Lot size calculation – MANUAL LOT ONLY                          |
-//+------------------------------------------------------------------+
-double CalculateLotSize(double atrValue, int orderType)
+int CountPositions()
 {
-   // use ONLY manual fixed lot
-   double lotSize = InpFixedLot;
-
-   double minLot = SymbolInfoDouble(expertSymbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(expertSymbol, SYMBOL_VOLUME_MAX);
-   double step   = SymbolInfoDouble(expertSymbol, SYMBOL_VOLUME_STEP);
-
-   // keep inside broker limits
-   if(lotSize < minLot)
-      lotSize = minLot;
-
-   if(lotSize > maxLot)
-      lotSize = maxLot;
-
-   // normalize to broker step
-   if(step > 0)
-      lotSize = MathFloor(lotSize / step) * step;
-
-   lotSize = NormalizeDouble(lotSize, 2);
-
-   return lotSize;
-}
-
-//+------------------------------------------------------------------+
-int CountOpenPositions(int type = -1)
-{
-   int count = 0;
-
-   for(int i = PositionsTotal()-1; i >= 0; i--)
+   int cnt = 0;
+   for(int i=0; i<PositionsTotal(); i++)
    {
       ulong t = PositionGetTicket(i);
-
-      if(PositionSelectByTicket(t) &&
-         PositionGetString(POSITION_SYMBOL) ==
-         expertSymbol &&
-         PositionGetInteger(POSITION_MAGIC) ==
-         expertMagic)
-      {
-         if(type == -1 ||
-            (int)PositionGetInteger(POSITION_TYPE)
-            == type)
-            count++;
-      }
+      if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         cnt++;
    }
-
-   return count;
+   return cnt;
 }
-
-//+------------------------------------------------------------------+
-void ManageTrailingStops(){}
-bool UpdateIndicatorData()
+int GetSpreadPoints()
 {
-   if(CopyBuffer(emaFastHandle,0,0,3,emaFast)<3)
-      return false;
-
-   if(CopyBuffer(emaSlowHandle,0,0,3,emaSlow)<3)
-      return false;
-
-   if(CopyBuffer(rsiHandle,0,0,3,rsi)<3)
-      return false;
-
-   if(CopyBuffer(atrHandle,0,0,3,atr)<3)
-      return false;
-
-   return true;
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   return (int)((ask - bid) / pointValue);
 }
-
-bool IsTradingSession(){ return true; }
-bool IsNewsTime(){ return false; }
-bool CheckDailyLossLimit(){ return false; }
-bool CheckDrawdownLimit(){ return false; }
-
+bool CheckDailyLoss()
+{
+   double curBal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double lossPct = (dailyStartBalance - curBal) / dailyStartBalance * 100.0;
+   if(lossPct >= MaxDailyLossPercent && !tradingPaused)
+   { tradingPaused = true; Print("Daily loss limit reached"); return true; }
+   return false;
+}
+bool CheckDrawdown()
+{
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(bal <= 0) return false;
+   double ddPct = (bal - eq) / bal * 100.0;
+   if(ddPct >= MaxDrawdownPercent && !drawdownHit)
+   { drawdownHit = true; Print("Max drawdown reached"); return true; }
+   return false;
+}
+void ManageTrailing() {} // optional, not needed for test
 //+------------------------------------------------------------------+
 EOF
 
