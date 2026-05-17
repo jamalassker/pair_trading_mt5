@@ -20,7 +20,7 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 
 # Copy EA files
 COPY ["Ryan Stanton Forex Bot.ex5", "/root/Ryan Stanton Forex Bot.ex5"]
-COPY ["Liquidity-Grabber_Pro_fix by @forexrobot5.ex5", "/root/Liquidity-Grabber_Pro_fix by @forexrobot5.ex5"]
+
 
 RUN cat > /entrypoint.sh <<EOF
 #!/bin/bash
@@ -58,8 +58,8 @@ fi
 
 mkdir -p "\$DATA_DIR/Experts"
 
-cp "/root/UNIVERSAL ARBITRAGE ENGINE PRO.ex5" "\$DATA_DIR/Experts/"
-cp "/root/Liquidity-Grabber_Pro_fix by @forexrobot5.ex5" "\$DATA_DIR/Experts/"
+cp "/root/Ryan Stanton Forex Bot.ex5" "\$DATA_DIR/Experts/"
+
 
 echo "✅ Copied EAs to \$DATA_DIR/Experts/"
 
