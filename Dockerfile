@@ -19,8 +19,8 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
     -O /root/mt5setup.exe
 
 # Copy EA files
-COPY ["crypto_momenum_gemeni.ex5", "/root/crypto_momenum_gemeni.ex5"]
-COPY ["crypto_momentum.ex5", "/root/crypto_momentum.ex5"]
+COPY ["MeanReversion_200EMA_EA.ex5", "/root/MeanReversion_200EMA_EA.ex5"]
+COPY ["OpeningRange_TrendIsolated_EA.ex5", "/root/OpeningRange_TrendIsolated_EA.ex5"]
 
 
 RUN cat > /entrypoint.sh <<EOF
@@ -59,8 +59,8 @@ fi
 
 mkdir -p "\$DATA_DIR/Experts"
 
-cp "/root/crypto_momenum_gemeni.ex5" "\$DATA_DIR/Experts/"
-cp "/root/crypto_momentum.ex5" "\$DATA_DIR/Experts/"
+cp "/root/MeanReversion_200EMA_EA.ex5" "\$DATA_DIR/Experts/"
+cp "/root/OpeningRange_TrendIsolated_EA.ex5" "\$DATA_DIR/Experts/"
 
 
 echo "✅ Copied EAs to \$DATA_DIR/Experts/"
